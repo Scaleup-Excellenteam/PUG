@@ -3,7 +3,8 @@
 Python 3.10+ autocomplete system with normalization, substring matching from
 every character position, one substitution/insertion/deletion, top-20 candidate
 caches, exact assignment scoring, optional popularity weighting, persistence,
-and a cumulative-input CLI. The implementation uses only the standard library.
+and both CLI and local web interfaces. The implementation uses only the
+standard library.
 
 ## Architecture
 
@@ -66,6 +67,61 @@ python main.py --mode popularity
 Each line entered is appended to the current query. Enter `#` to select the
 previous number-one result and reset the query. `Ctrl+C` and EOF save usage
 statistics and close the database cleanly.
+
+## Run the local website
+
+Start the Google-like English interface after building the index:
+
+```powershell
+python web_app.py
+```
+
+Then open `http://localhost:8000`. Suggestions appear while typing. Click a
+suggestion, or select it with the arrow keys and Enter, to increment its
+`usage_count`, show the selected sentence, clear the search box, and begin a
+new search. This is the website equivalent of entering `#` in the CLI, except
+that the website can select any of the five suggestions instead of only the
+first one.
+
+The website defaults to popularity ranking so selections influence future
+results. To preserve the assignment's official text-only score and ordering:
+
+```powershell
+python web_app.py --mode assignment
+```
+
+The server binds to `127.0.0.1` by default, so it is accessible only from the
+local computer. Stop it with `Ctrl+C`; usage statistics are saved both after
+each selection and during graceful shutdown.
+
+The microphone button uses the browser's Web Speech API for English voice
+input. It requires a supported browser (normally Chrome or Edge), microphone
+permission, and may require an internet connection depending on the browser's
+recognition service. The feature is detected at runtime and is disabled with a
+clear tooltip when the browser does not provide speech recognition. Recognized
+text is placed in the same search field and goes through the unchanged local
+normalization, scoring, and autocomplete engine.
+
+## Local administration dashboard
+
+Open `http://localhost:8000/admin` while the website is running. Because the
+server binds to the local loopback interface, the dashboard currently has no
+password. It provides:
+
+- complete corpus, source-file, Master Array, index, runtime, and storage data;
+- an append-only `data/analytics_events.jsonl` audit trail containing every web
+  search, result IDs and scores, input method, latency, selection, local client
+  metadata, error, server lifecycle event, and administrative action;
+- search totals, typed/voice split, no-result rate, unique and top queries,
+  P50/P95/maximum latency, top selections, hourly activity, and recent events;
+- paginated access to every Master Array record;
+- complete JSON and CSV analytics exports;
+- confirmed actions for resetting analytics or popularity data; and
+- a confirmed, background replacement-index build from `Archive/Archive.zip`.
+
+Replacement builds are created under `rebuilds/` and never overwrite or
+activate the live index automatically. Reset buttons require their displayed
+confirmation phrase exactly to guard against accidental data loss.
 
 ## Python API
 

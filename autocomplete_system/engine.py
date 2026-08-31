@@ -112,6 +112,13 @@ class AutocompleteSystem:
         self.master_array[sentence_id].usage_count += 1
         self._has_usage_counts = True
 
+    def reset_usage_counts(self) -> None:
+        """Reset every popularity counter without changing the search index."""
+
+        for record in self.master_array:
+            record.usage_count = 0
+        self._has_usage_counts = False
+
     def save_usage_stats(self) -> None:
         """Persist popularity data when this system has a data directory."""
 
