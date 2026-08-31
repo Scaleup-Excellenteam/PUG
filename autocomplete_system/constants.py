@@ -10,5 +10,6 @@ DEFAULT_DATA_DIRECTORY = Path("data")
 INDEX_FILENAME = "index.pkl"
 MASTER_ARRAY_FILENAME = "sentences.pkl"
 USAGE_STATS_FILENAME = "usage_stats.json"
+ANALYTICS_EVENTS_FILENAME = "analytics_events.jsonl"
 SQLITE_INDEX_FILENAME = "sentences.sqlite3"
 SQLITE_VARIANT_BATCH_SIZE = 100

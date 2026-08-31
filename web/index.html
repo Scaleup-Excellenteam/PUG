@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta
+      name="description"
+      content="Fast local sentence autocomplete with typo tolerance and explainable scores."
+    >
+    <title>PUG Search — Local Autocomplete</title>
+    <link rel="stylesheet" href="/styles.css">
+    <script src="/app.js" defer></script>
+  </head>
+  <body>
+    <header class="topbar" aria-label="Application header">
+      <span class="topbar__product">Autocomplete Project</span>
+      <nav class="topbar__nav" aria-label="Primary navigation">
+        <a href="/admin">Admin</a>
+        <span class="local-badge"><span aria-hidden="true"></span>Local</span>
+      </nav>
+    </header>
+
+    <main class="search-page">
+      <section class="hero" aria-labelledby="product-title">
+        <h1 id="product-title" class="wordmark" aria-label="PUG Search">
+          <span class="wordmark__blue">P</span><span class="wordmark__red">U</span><span class="wordmark__yellow">G</span>
+          <span class="wordmark__search">Search</span>
+        </h1>
+        <p class="tagline">Search millions of sentences as you type</p>
+
+        <div class="search-shell" id="search-shell">
+          <div class="search-row">
+            <span class="search-icon" aria-hidden="true"></span>
+            <label class="visually-hidden" for="search-input">Search sentences</label>
+            <input
+              id="search-input"
+              type="search"
+              name="query"
+              placeholder="Start typing to search"
+              autocomplete="off"
+              autocapitalize="off"
+              spellcheck="false"
+              aria-autocomplete="list"
+              aria-controls="suggestions"
+              aria-expanded="false"
+              aria-activedescendant=""
+            >
+            <button id="clear-button" class="clear-button" type="button" aria-label="Clear search" hidden>×</button>
+            <button
+              id="voice-button"
+              class="voice-button"
+              type="button"
+              aria-label="Search by voice"
+              aria-pressed="false"
+              title="Search by voice"
+            >
+              <span class="microphone-icon" aria-hidden="true"></span>
+            </button>
+            <span id="loading-indicator" class="loading-indicator" aria-label="Searching" hidden></span>
+          </div>
+          <div id="suggestions" class="suggestions" role="listbox" hidden></div>
+        </div>
+
+        <p id="search-status" class="search-status" role="status" aria-live="polite"></p>
+
+        <section id="selection-card" class="selection-card" aria-live="polite" hidden>
+          <span class="selection-card__check" aria-hidden="true">✓</span>
+          <div>
+            <p class="selection-card__label">Full sentence selected</p>
+            <p id="selected-sentence" class="selection-card__sentence"></p>
+            <p id="selected-source" class="selection-card__source"></p>
+          </div>
+        </section>
+
+        <aside class="tip-card" aria-label="Selection help">
+          <span class="tip-card__icon" aria-hidden="true">#</span>
+          <p>
+            In the CLI, <strong>#</strong> selected the first suggestion and started a new search.
+            Here, click any suggestion or select it with <strong>Enter</strong>.
+          </p>
+        </aside>
+      </section>
+    </main>
+
+    <footer>
+      <span>Local autocomplete engine</span>
+      <span>One-edit typo tolerance · Explainable scoring</span>
+    </footer>
+  </body>
+</html>
