@@ -83,6 +83,33 @@ def build_index(sources: InputSources) -> tuple[CompressedSuffixTrie, list[Sente
     return trie, master_array
 
 
+def build_array_index(sources: InputSources) -> tuple[SuffixArrayIndex, list[SentenceRecord]]:
+    from .suffix_array import SuffixArrayIndex
+    alphabet = set()
+    master_array: list[SentenceRecord] = []
+    
+    index = SuffixArrayIndex(alphabet=tuple())
+
+    for source_line in iter_source_lines(_coerce_sources(sources)):
+        normalized = normalize_text(source_line.original_text)
+        sentence_id = len(master_array)
+        master_array.append(
+            SentenceRecord(
+                original_text=source_line.original_text,
+                normalized_text=normalized,
+                source_path=source_line.source_path,
+                line_number=source_line.line_number,
+            )
+        )
+        if normalized:
+            alphabet.update(normalized)
+            index.insert_sentence(normalized, sentence_id, None, None)
+
+    index.alphabet = tuple(sorted(alphabet))
+    index.build()
+    return index, master_array
+
+
 def _cache_ranked_id(
     cache: dict[str, list[tuple[tuple[object, ...], int]]],
     substring: str,

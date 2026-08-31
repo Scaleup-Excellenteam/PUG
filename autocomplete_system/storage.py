@@ -16,8 +16,9 @@ from .constants import (
 from .models import SentenceRecord
 from .sqlite_index import SQLiteSubstringIndex
 from .trie import CompressedSuffixTrie
+from .suffix_array import SuffixArrayIndex
 
-SearchIndex: TypeAlias = CompressedSuffixTrie | SQLiteSubstringIndex
+SearchIndex: TypeAlias = CompressedSuffixTrie | SQLiteSubstringIndex | SuffixArrayIndex
 
 
 def _atomic_pickle_dump(path: Path, value: Any) -> None:
@@ -74,7 +75,7 @@ def load_index(data_directory: Path) -> tuple[SearchIndex, list[SentenceRecord]]
         not isinstance(envelope, dict)
         or envelope.get("version") != INDEX_VERSION
         or not isinstance(
-            envelope.get("index"), (CompressedSuffixTrie, SQLiteSubstringIndex)
+            envelope.get("index"), (CompressedSuffixTrie, SQLiteSubstringIndex, SuffixArrayIndex)
         )
     ):
         raise ValueError(

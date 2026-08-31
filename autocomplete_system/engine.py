@@ -55,7 +55,7 @@ class AutocompleteSystem:
             return []
 
         mode = self.ranking_mode if ranking_mode is None else ranking_mode
-        if isinstance(self.index, SQLiteSubstringIndex):
+        if isinstance(self.index, SQLiteSubstringIndex) or type(self.index).__name__ == 'SuffixArrayIndex':
             text_scores = self.index.candidate_text_scores(
                 normalized_query,
                 mode,
