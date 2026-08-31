@@ -9,6 +9,7 @@ from .models import AutoCompleteData, RankingMode, SentenceRecord
 from .normalization import normalize_text
 from .sqlite_index import SQLiteSubstringIndex
 from .storage import SearchIndex, load_index, save_usage_stats
+from autocomplete_system.error_cache import ErrorCache
 
 
 class AutocompleteSystem:
@@ -26,6 +27,7 @@ class AutocompleteSystem:
         self.data_directory = data_directory
         self.ranking_mode = ranking_mode
         self._has_usage_counts = any(record.usage_count for record in master_array)
+        self.error_cache = ErrorCache()
 
     @property
     def trie(self) -> SearchIndex:
@@ -50,9 +52,12 @@ class AutocompleteSystem:
     ) -> list[tuple[int, AutoCompleteData]]:
         """Return result IDs and public completion records, best first."""
 
-        normalized_query = normalize_text(prefix)
-        if not normalized_query or k <= 0:
+        original_query = normalize_text(prefix)
+        if not original_query or k <= 0:
             return []
+
+        # Phase 1: Fast O(L) scan and replace via Aho-Corasick DFA
+        normalized_query = self.error_cache.scan_and_replace(original_query)
 
         mode = self.ranking_mode if ranking_mode is None else ranking_mode
         if isinstance(self.index, SQLiteSubstringIndex) or type(self.index).__name__ == 'SuffixArrayIndex':
@@ -97,6 +102,30 @@ class AutocompleteSystem:
                     ),
                 )
             )
+
+        # Phase 2: Organic Learning (Asynchronous Write Path)
+        # If we didn't use the cache, but found a typo correction organically, submit it!
+        if original_query == normalized_query and results:
+            best_id, best_data = results[0]
+            # A score < 2*len means we used a 1-edit penalty to find it
+            if best_data.score < 2 * len(original_query):
+                record_norm = self.master_array[best_id].normalized_text
+                # Find which 1-edit variant successfully matched
+                from autocomplete_system.scoring import generate_scored_variants
+                # Use a basic english alphabet for recovery
+                alphabet = "abcdefghijklmnopqrstuvwxyz0123456789 "
+                variants = generate_scored_variants(original_query, alphabet)
+                
+                best_variant = None
+                best_variant_score = -1
+                for var, sc in variants.items():
+                    if sc > best_variant_score and var in record_norm:
+                        best_variant = var
+                        best_variant_score = sc
+                        
+                if best_variant:
+                    self.error_cache.submit_correction(original_query, best_variant)
+
         return results
 
     def get_best_k_completions(self, prefix: str) -> list[AutoCompleteData]:
