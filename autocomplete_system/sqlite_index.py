@@ -48,6 +48,7 @@ class SQLiteSubstringIndex:
             self._connection = sqlite3.connect(self._database_path)
             self._connection.execute("PRAGMA query_only = ON")
             self._connection.execute("PRAGMA cache_size = -65536")
+            self._connection.execute("PRAGMA mmap_size = 30000000000")
         return self._connection
 
     def close(self) -> None:
