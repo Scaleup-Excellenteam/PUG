@@ -4,6 +4,7 @@ import http.client
 import json
 import tempfile
 import threading
+import time
 import unittest
 from http import HTTPStatus
 from pathlib import Path
@@ -278,6 +279,7 @@ class WebApplicationTests(unittest.TestCase):
             "/api/admin/actions/reset-analytics",
             "/api/admin/actions/reset-popularity",
             "/api/admin/actions/rebuild-index",
+            "/api/admin/actions/activate-rebuild",
         ):
             with self.subTest(path=path):
                 self.assert_raw_post_error(path, b"{", HTTPStatus.BAD_REQUEST)
@@ -622,6 +624,36 @@ class WebApplicationTests(unittest.TestCase):
         )
         self.assertEqual(action["target_directory"], "replacement")
 
+    def test_admin_activate_rebuild_reports_no_completed_build(self) -> None:
+        with self.assertRaises(HTTPError) as context:
+            self.post_json(
+                "/api/admin/actions/activate-rebuild",
+                {"confirmation": "ACTIVATE SNAPSHOT"},
+            )
+        self.assertEqual(context.exception.code, HTTPStatus.CONFLICT)
+
+    def test_admin_activate_rebuild_success_is_audited(self) -> None:
+        snapshot = {"data_directory": "/some/data", "activated_at": "now", "sentence_count": 1}
+        with patch.object(self.admin_service, "activate_rebuild", return_value=snapshot):
+            result = self.post_json(
+                "/api/admin/actions/activate-rebuild",
+                {"confirmation": "ACTIVATE SNAPSHOT"},
+            )
+        self.assertEqual(result["snapshot"], snapshot)
+        events, _ = self.analytics.read_events()
+        action = next(
+            event for event in events if event.get("action") == "activate_snapshot"
+        )
+        self.assertEqual(action["data_directory"], "/some/data")
+
+    def test_admin_activate_rebuild_rejects_non_string_target_directory(self) -> None:
+        with self.assertRaises(HTTPError) as context:
+            self.post_json(
+                "/api/admin/actions/activate-rebuild",
+                {"confirmation": "ACTIVATE SNAPSHOT", "target_directory": 7},
+            )
+        self.assertEqual(context.exception.code, HTTPStatus.BAD_REQUEST)
+
     def test_client_voice_events_are_persisted(self) -> None:
         self.post_json(
             "/api/events",
@@ -673,6 +705,102 @@ class WebApplicationTests(unittest.TestCase):
             blocked_server.shutdown()
             thread.join(timeout=2)
             blocked_server.server_close()
+
+
+class ZeroDowntimeHotSwapTests(unittest.TestCase):
+    """End-to-end proof of the ZDT hand-off through a live HTTP server.
+
+    A real server is started once, serving one corpus. A second, different
+    snapshot is built and published purely on the filesystem (the pointer
+    file); a SnapshotWatcher polling in the background adopts it. The
+    running server is never restarted and its socket never stops accepting
+    connections -- exactly the "add a data source live, remotely, with zero
+    downtime" behavior this feature exists for.
+    """
+
+    def setUp(self) -> None:
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary_directory.name)
+
+        old_corpus = self.root / "old-corpus"
+        old_corpus.mkdir()
+        (old_corpus / "old.txt").write_text("Original sentence one.\n", encoding="utf-8")
+        old_index, old_master = build_index(old_corpus)
+        self.old_data_directory = self.root / "old-data"
+        save_index(self.old_data_directory, old_index, old_master)
+
+        self.system = AutocompleteSystem.load(self.old_data_directory)
+        self.server = create_server(self.system, port=0)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        host, port = self.server.server_address
+        self.base_url = f"http://{host}:{port}"
+
+    def tearDown(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
+        self.system.close()
+        self.temporary_directory.cleanup()
+
+    def test_new_data_source_is_served_live_after_a_filesystem_only_publish(self) -> None:
+        from autocomplete_system.snapshot import SnapshotWatcher, write_snapshot_pointer
+
+        pointer_path = self.root / "rebuilds" / "active_snapshot.json"
+        watcher = SnapshotWatcher(pointer_path, self.system, poll_interval_seconds=0.02)
+        watcher.start()
+        try:
+            before = json.loads(
+                urlopen(f"{self.base_url}/api/suggestions?query=original", timeout=2)
+                .read()
+                .decode("utf-8")
+            )
+            self.assertEqual(
+                before["suggestions"][0]["completed_sentence"], "Original sentence one."
+            )
+
+            new_corpus = self.root / "new-corpus"
+            new_corpus.mkdir()
+            (new_corpus / "new.txt").write_text(
+                "Remotely added sentence.\n", encoding="utf-8"
+            )
+            new_index, new_master = build_index(new_corpus)
+            new_data_directory = self.root / "new-data"
+            save_index(new_data_directory, new_index, new_master)
+
+            # This is the entire "remote data source add": nothing here
+            # talks to the running server. It only touches the filesystem.
+            write_snapshot_pointer(pointer_path, new_data_directory)
+
+            deadline = time.monotonic() + 5
+            after: dict[str, object] = {}
+            while time.monotonic() < deadline:
+                after = json.loads(
+                    urlopen(
+                        f"{self.base_url}/api/suggestions?query=remotely", timeout=2
+                    )
+                    .read()
+                    .decode("utf-8")
+                )
+                if after.get("suggestions"):
+                    break
+                time.sleep(0.02)
+
+            self.assertTrue(after.get("suggestions"))
+            self.assertEqual(
+                after["suggestions"][0]["completed_sentence"], "Remotely added sentence."
+            )
+
+            # The server was never restarted or made to refuse connections;
+            # its socket kept answering requests throughout the swap.
+            still_up = json.loads(
+                urlopen(f"{self.base_url}/api/suggestions?query=remotely", timeout=2)
+                .read()
+                .decode("utf-8")
+            )
+            self.assertTrue(still_up.get("suggestions"))
+        finally:
+            watcher.stop()
 
 
 class RebuildManagerTests(unittest.TestCase):

@@ -12,6 +12,8 @@ from autocomplete_system.analytics import AdminService, AnalyticsStore, RebuildM
 from autocomplete_system.engine import AutocompleteSystem
 from autocomplete_system.indexer import build_index
 from autocomplete_system.models import RankingMode
+from autocomplete_system.snapshot import read_snapshot_pointer
+from autocomplete_system.storage import save_index
 from autocomplete_system.trie import CompressedSuffixTrie
 
 
@@ -216,6 +218,75 @@ class AdminServiceTests(unittest.TestCase):
         )
         self.assertEqual(service.start_rebuild()["pid"], 123)
         fake_manager.start.assert_called_once_with()
+
+    def test_activate_rebuild_without_a_completed_build_is_rejected(self) -> None:
+        with self.assertRaises(RuntimeError):
+            self.service.activate_rebuild()
+        self.assertIsNone(self.service.snapshot_status())
+
+    def test_activate_rebuild_publishes_the_latest_completed_build(self) -> None:
+        completed_dir = self.root / "rebuilds" / "data-rebuild-completed"
+        completed_corpus = self.root / "completed-corpus"
+        completed_corpus.mkdir()
+        (completed_corpus / "new.txt").write_text(
+            "Freshly rebuilt sentence.\n", encoding="utf-8"
+        )
+        index, master = build_index(completed_corpus)
+        save_index(completed_dir, index, master)
+
+        fake_manager = unittest.mock.Mock()
+        fake_manager.status.return_value = {
+            "state": "completed",
+            "target_directory": str(completed_dir),
+        }
+        service = AdminService(
+            self.system, self.analytics, self.root, rebuild_manager=fake_manager
+        )
+
+        record = service.activate_rebuild()
+
+        self.assertEqual(record["data_directory"], str(completed_dir.resolve()))
+        status = service.snapshot_status()
+        assert status is not None
+        self.assertEqual(status["data_directory"], str(completed_dir.resolve()))
+        on_disk = read_snapshot_pointer(service.pointer_path)
+        assert on_disk is not None
+        self.assertEqual(on_disk["data_directory"], str(completed_dir.resolve()))
+
+    def test_activate_rebuild_rejects_a_target_directory_that_no_longer_exists(self) -> None:
+        fake_manager = unittest.mock.Mock()
+        fake_manager.status.return_value = {
+            "state": "completed",
+            "target_directory": str(self.root / "vanished"),
+        }
+        service = AdminService(
+            self.system, self.analytics, self.root, rebuild_manager=fake_manager
+        )
+        with self.assertRaises(FileNotFoundError):
+            service.activate_rebuild()
+
+    def test_activate_rebuild_accepts_an_explicit_target_directory(self) -> None:
+        explicit_dir = self.root / "explicit-data"
+        corpus = self.root / "explicit-corpus"
+        corpus.mkdir()
+        (corpus / "one.txt").write_text("Explicit sentence.\n", encoding="utf-8")
+        index, master = build_index(corpus)
+        save_index(explicit_dir, index, master)
+
+        record = self.service.activate_rebuild(str(explicit_dir))
+        self.assertEqual(record["data_directory"], str(explicit_dir.resolve()))
+
+    def test_note_snapshot_activated_invalidates_cached_corpus_and_popularity(self) -> None:
+        self.service.dashboard()  # populate the caches
+        self.assertIsNotNone(self.service._static_corpus)
+        self.system.record_selection(0)
+        self.service.note_selection(0)
+
+        self.service.note_snapshot_activated(self.root / "data")
+
+        self.assertIsNone(self.service._static_corpus)
+        self.assertIsNone(self.service._usage_by_id)
+        self.assertEqual(self.service._usage_total, 0)
 
     def test_empty_master_array_dashboard_has_safe_averages(self) -> None:
         empty_system = AutocompleteSystem(CompressedSuffixTrie(), [])

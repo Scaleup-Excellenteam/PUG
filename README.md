@@ -126,12 +126,48 @@ password. It provides:
   usage count and `5 * usage_count` ranking bonus, independently of analytics logs;
 - paginated access to every Master Array record;
 - complete JSON and CSV analytics exports;
-- confirmed actions for resetting analytics or popularity data; and
-- a confirmed, background replacement-index build from `Archive/Archive.zip`.
+- confirmed actions for resetting analytics or popularity data;
+- a confirmed, background replacement-index build from `Archive/Archive.zip`; and
+- a confirmed, zero-downtime activation of the most recent completed
+  replacement build (see "Zero-downtime snapshot activation" below).
 
-Replacement builds are created under `rebuilds/` and never overwrite or
-activate the live index automatically. Reset buttons require their displayed
-confirmation phrase exactly to guard against accidental data loss.
+Replacement builds are created under `rebuilds/` and never overwrite the live
+index in place; activating one is always a separate, explicit step. Reset
+buttons require their displayed confirmation phrase exactly to guard against
+accidental data loss.
+
+## Zero-downtime snapshot activation (ZDT)
+
+Offline indexing and online serving are decoupled through the filesystem, so
+a new data source can be built and put into production while the website
+keeps answering every request, with no restart:
+
+1. **Build.** `build_index.py --data-dir <path>` (directly, or via the
+   Admin "Start safe rebuild" action, which does the same thing against
+   `Archive/Archive.zip` into a fresh `rebuilds/data-rebuild-<timestamp>/`
+   directory) writes a brand-new, independently loadable snapshot without
+   touching whatever directory the running server currently serves from.
+2. **Activate.** `activate_snapshot.py --data-dir <path>` (directly, or via
+   the Admin "Activate latest build" action) validates that snapshot by
+   loading it, then atomically rewrites one small pointer file,
+   `rebuilds/active_snapshot.json`, to name it as current. The rewrite is a
+   write-to-temp-file-then-rename, so the pointer is never observed
+   half-written. A broken or incomplete build can never become active: the
+   validation load raises before the pointer is touched.
+3. **Adopt.** Every running `web_app.py` server polls that same pointer file
+   in the background (every 2 seconds by default) and, on change, loads the
+   new snapshot and swaps it into its already-running `AutocompleteSystem`
+   in place -- same process, same socket, same object identity. In-flight
+   requests keep being served by the previous snapshot until the swap
+   completes; there is no restart and no window in which the server stops
+   accepting connections.
+
+Because steps 1 and 2 only ever touch the filesystem, they need not run on
+the same machine as the server, or be triggered through it at all -- any
+process with access to the same `rebuilds/` location (for example a shared
+or remote-mounted volume) can publish a new snapshot, and every server
+watching that location adopts it live. That is what makes adding a new data
+source possible "live, remotely, with zero downtime."
 
 ## Real-time operational logs
 

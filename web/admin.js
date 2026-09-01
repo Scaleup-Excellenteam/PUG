@@ -24,6 +24,11 @@ const actionDefinitions = {
     description: "This starts a resource-intensive build from Archive.zip in a separate folder. The active index remains untouched.",
     phrase: "REBUILD INDEX",
   },
+  "activate-rebuild": {
+    title: "Activate the replacement build?",
+    description: "This atomically points the running service at the most recently completed replacement build. It takes effect within a few seconds, with no restart and no dropped requests.",
+    phrase: "ACTIVATE SNAPSHOT",
+  },
 };
 
 const byId = (id) => document.getElementById(id);
@@ -244,12 +249,17 @@ function scheduleLogFilter() {
   state.logSearchTimer = window.setTimeout(loadSystemLogs, 250);
 }
 
-function renderRebuild(rebuild) {
+function renderRebuild(rebuild, snapshot) {
   byId("rebuild-state").textContent = rebuild.state[0].toUpperCase() + rebuild.state.slice(1);
   byId("rebuild-target").textContent = rebuild.target_directory || "No replacement build has been started.";
   const log = byId("rebuild-log");
   log.hidden = !rebuild.log_tail.length; log.textContent = rebuild.log_tail.join("\n");
   document.querySelector('[data-action="rebuild-index"]').disabled = rebuild.state === "running";
+  byId("activate-rebuild-button").disabled = rebuild.state !== "completed";
+  byId("snapshot-state").textContent = snapshot && snapshot.data_directory ? "Active" : "Original data directory";
+  byId("snapshot-target").textContent = snapshot && snapshot.data_directory
+    ? `${snapshot.data_directory} (activated ${date(snapshot.activated_at)})`
+    : "No replacement snapshot has been activated. Serving from the directory the server was started with.";
 }
 
 async function loadSentences() {
@@ -278,7 +288,7 @@ async function loadDashboard(showStatus = false) {
     renderPopularityControl(data.configuration.popularity_enabled);
     renderTopQueries(data.analytics.top_queries); renderPopularity(data.corpus.popularity.top_sentences, data.configuration.alpha, data.configuration.popularity_enabled);
     renderSources(data.corpus.sources); renderStorage(data.storage);
-    renderRecentEvents(data.analytics.recent_events, data.analytics.event_count); renderRebuild(data.rebuild);
+    renderRecentEvents(data.analytics.recent_events, data.analytics.event_count); renderRebuild(data.rebuild, data.snapshot);
     byId("last-updated").textContent = date(data.generated_at);
     byId("dashboard-status").textContent = `Tracking ${number(data.analytics.event_count)} complete events from ${number(data.corpus.total_sentences)} sentence records.`;
   } catch (error) { byId("dashboard-status").textContent = error.message; }

@@ -583,5 +583,120 @@ class ErrorCacheTests(unittest.TestCase):
         self.assertEqual(self.cache.scan_and_replace("hello world"), "hello world")
 
 
+class SnapshotAdoptionTests(unittest.TestCase):
+    """Tests for the in-place ZDT snapshot swap (``AutocompleteSystem.adopt_snapshot``)."""
+
+    def setUp(self) -> None:
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary_directory.name)
+        corpus = self.root / "corpus"
+        corpus.mkdir()
+        (corpus / "old.txt").write_text(
+            "Old alpha sentence.\nOld beta sentence.\n", encoding="utf-8"
+        )
+        index, master_array = build_index(corpus)
+        self.system = AutocompleteSystem(index, master_array, data_directory=self.root / "old-data")
+
+    def tearDown(self) -> None:
+        self.system.close()
+        self.temporary_directory.cleanup()
+
+    def test_adopt_snapshot_replaces_state_in_place(self) -> None:
+        new_corpus = self.root / "new_corpus"
+        new_corpus.mkdir()
+        (new_corpus / "new.txt").write_text("Fresh gamma sentence.\n", encoding="utf-8")
+        new_data_dir = self.root / "new-data"
+        new_index, new_master_array = build_index(new_corpus)
+
+        identity_before = id(self.system)
+        self.system.adopt_snapshot(new_index, new_master_array, new_data_dir)
+
+        self.assertEqual(id(self.system), identity_before)
+        self.assertEqual(self.system.data_directory, new_data_dir)
+        self.assertEqual(len(self.system.master_array), len(new_master_array))
+        self.assertEqual(
+            self.system.get_best_k_completions("fresh")[0].completed_sentence,
+            "Fresh gamma sentence.",
+        )
+        # The old corpus is gone: only the new snapshot is searchable now.
+        self.assertEqual(self.system.get_best_k_completions("alpha"), [])
+
+    def test_adopt_snapshot_resets_error_cache_and_search_count(self) -> None:
+        self.system.error_cache.submit_correction("mistake", "fix")
+        self.system.error_cache.rebuild_cycle()
+        self.system._search_count = 7
+
+        new_corpus = self.root / "new_corpus"
+        new_corpus.mkdir()
+        (new_corpus / "new.txt").write_text("Fresh gamma sentence.\n", encoding="utf-8")
+        new_index, new_master_array = build_index(new_corpus)
+        self.system.adopt_snapshot(new_index, new_master_array, self.root / "new-data")
+
+        self.assertEqual(self.system.error_cache.cache, {})
+        self.assertEqual(self.system._search_count, 0)
+
+    def test_adopt_snapshot_closes_previous_sqlite_connection(self) -> None:
+        sqlite_corpus = self.root / "sqlite_corpus"
+        sqlite_corpus.mkdir()
+        (sqlite_corpus / "a.txt").write_text("Alpha one.\n", encoding="utf-8")
+        sqlite_data = self.root / "sqlite-data"
+        sqlite_index, sqlite_master = build_sqlite_index(sqlite_corpus, sqlite_data)
+        system = AutocompleteSystem(sqlite_index, sqlite_master, data_directory=sqlite_data)
+        system.get_best_k_completions("alpha")  # forces the connection open
+        self.assertIsNotNone(sqlite_index._connection)
+
+        new_corpus = self.root / "trie_corpus"
+        new_corpus.mkdir()
+        (new_corpus / "b.txt").write_text("Beta two.\n", encoding="utf-8")
+        new_index, new_master = build_index(new_corpus)
+        system.adopt_snapshot(new_index, new_master, new_corpus)
+
+        self.assertIsNone(sqlite_index._connection)
+        system.close()
+
+    def test_in_flight_request_keeps_seeing_the_snapshot_it_started_with(self) -> None:
+        """A concurrent adopt_snapshot mid-request must not corrupt that request.
+
+        get_ranked_completions must capture its own local reference to
+        ``index``/``master_array`` up front, exactly like the ErrorCache's
+        documented "atomic swap" idiom, so that a hot swap triggered by
+        another thread partway through a search cannot make it read a
+        mismatched, already-swapped-out master array.
+        """
+
+        class SwappingIndex:
+            """Wraps the real index and swaps the system mid-search, once."""
+
+            def __init__(self, real_index: object, system: AutocompleteSystem) -> None:
+                self._real_index = real_index
+                self._system = system
+                self._swapped = False
+
+            def candidate_text_scores(self, *args: object, **kwargs: object) -> object:
+                scores = self._real_index.candidate_text_scores(*args, **kwargs)  # type: ignore[attr-defined]
+                if not self._swapped:
+                    self._swapped = True
+                    smaller_corpus = self._system.data_directory.parent / "smaller"
+                    smaller_corpus.mkdir(exist_ok=True)
+                    (smaller_corpus / "only.txt").write_text(
+                        "Totally unrelated line.\n", encoding="utf-8"
+                    )
+                    smaller_index, smaller_master = build_index(smaller_corpus)
+                    self._system.adopt_snapshot(
+                        smaller_index, smaller_master, smaller_corpus
+                    )
+                return scores
+
+        real_index = self.system.index
+        self.system.index = SwappingIndex(real_index, self.system)
+        try:
+            results = self.system.get_best_k_completions("old alpha")
+        finally:
+            self.system.index = real_index
+
+        self.assertTrue(results)
+        self.assertEqual(results[0].completed_sentence, "Old alpha sentence.")
+
+
 if __name__ == "__main__":
     unittest.main()

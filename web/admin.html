@@ -146,6 +146,10 @@
             <span class="action-card__icon action-card__icon--yellow">↻</span><h3>Build replacement index</h3><p>Build from Archive.zip in a separate folder. The active index is never overwritten.</p>
             <button class="button button--warning admin-action" data-action="rebuild-index" type="button">Start safe rebuild</button>
           </article>
+          <article class="action-card">
+            <span class="action-card__icon action-card__icon--yellow">⇪</span><h3>Activate replacement build (ZDT)</h3><p>Atomically point the live service at the most recent completed replacement build. The running server adopts it within a few seconds, with no restart and no dropped requests.</p>
+            <button id="activate-rebuild-button" class="button button--warning admin-action" data-action="activate-rebuild" type="button" disabled>Activate latest build</button>
+          </article>
           <article class="action-card action-card--danger">
             <span class="action-card__icon action-card__icon--red">×</span><h3>Reset analytics</h3><p>Erase the complete search and administrative event history.</p>
             <button class="button button--danger admin-action" data-action="reset-analytics" type="button">Reset analytics</button>
@@ -159,6 +163,10 @@
           <div><strong>Replacement-index build</strong><span id="rebuild-state">Idle</span></div>
           <p id="rebuild-target">No replacement build has been started.</p>
           <pre id="rebuild-log" hidden></pre>
+        </div>
+        <div class="rebuild-status">
+          <div><strong>Active snapshot (ZDT)</strong><span id="snapshot-state">Original data directory</span></div>
+          <p id="snapshot-target">No replacement snapshot has been activated. Serving from the directory the server was started with.</p>
         </div>
       </section>
     </main>
