@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import ipaddress
 import json
+import logging
 import mimetypes
 import time
 from http import HTTPStatus
@@ -16,6 +17,7 @@ from urllib.parse import parse_qs, urlsplit
 from autocomplete_system.analytics import AdminService, AnalyticsStore
 from autocomplete_system.constants import DEFAULT_DATA_DIRECTORY
 from autocomplete_system.engine import AutocompleteSystem
+from autocomplete_system.logging_config import configure_system_logging, log_event
 from autocomplete_system.models import AutoCompleteData, RankingMode
 from autocomplete_system.normalization import normalize_text
 
@@ -35,6 +37,7 @@ STATIC_FILES = {
     "/admin.css": "admin.css",
     "/admin.js": "admin.js",
 }
+LOGGER = logging.getLogger("autocomplete.web")
 
 
 def _completion_payload(
@@ -73,6 +76,15 @@ def create_request_handler(
                 return
             if request.path == "/api/admin/sentences":
                 self._serve_admin_sentences(parse_qs(request.query))
+                return
+            if request.path == "/api/admin/log-files":
+                self._serve_admin_log_files()
+                return
+            if request.path == "/api/admin/logs":
+                self._serve_admin_logs(parse_qs(request.query))
+                return
+            if request.path == "/api/admin/logs/download":
+                self._serve_admin_log_download(parse_qs(request.query))
                 return
             if request.path == "/api/admin/export":
                 self._serve_admin_export(parse_qs(request.query).get("format", ["json"])[0])
@@ -138,6 +150,17 @@ def create_request_handler(
                     {"suggestions": payload, "duration_ms": duration_ms},
                 )
             except Exception as error:
+                log_event(
+                    LOGGER,
+                    "web_search_failed",
+                    level=logging.ERROR,
+                    query=query,
+                    input_method=input_method,
+                    error_type=type(error).__name__,
+                    error_message=str(error),
+                    exc_info=True,
+                    **self._request_metadata(),
+                )
                 if analytics is not None:
                     analytics.record(
                         "error",
@@ -235,6 +258,13 @@ def create_request_handler(
                     details=details,
                     **self._request_metadata(),
                 )
+            log_event(
+                LOGGER,
+                "client_event_received",
+                client_event_type=event_type,
+                client_details=details,
+                **self._request_metadata(),
+            )
             self._send_json(HTTPStatus.ACCEPTED, {"recorded": True})
 
         def _serve_admin_dashboard(self) -> None:
@@ -289,6 +319,63 @@ def create_request_handler(
                     {"error": "Export format must be json or csv."},
                 )
 
+        def _serve_admin_log_files(self) -> None:
+            if not self._require_admin():
+                return
+            assert admin_service is not None
+            self._send_json(HTTPStatus.OK, {"files": admin_service.log_files()})
+
+        def _serve_admin_logs(self, parameters: dict[str, list[str]]) -> None:
+            if not self._require_admin():
+                return
+            try:
+                limit = int(parameters.get("limit", ["200"])[0])
+            except ValueError:
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {"error": "limit must be an integer."},
+                )
+                return
+            if limit < 1 or limit > 500:
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {"error": "limit must be between 1 and 500."},
+                )
+                return
+            assert admin_service is not None
+            try:
+                payload = admin_service.read_system_logs(
+                    parameters.get("file", ["system.jsonl"])[0],
+                    limit,
+                    parameters.get("level", [""])[0],
+                    parameters.get("component", [""])[0],
+                    parameters.get("search", [""])[0],
+                )
+            except (ValueError, FileNotFoundError) as error:
+                self._send_json(HTTPStatus.NOT_FOUND, {"error": str(error)})
+                return
+            self._send_json(HTTPStatus.OK, payload)
+
+        def _serve_admin_log_download(
+            self,
+            parameters: dict[str, list[str]],
+        ) -> None:
+            if not self._require_admin():
+                return
+            assert admin_service is not None
+            filename = parameters.get("file", ["system.jsonl"])[0]
+            try:
+                path = admin_service.resolve_log_file(filename)
+                body = path.read_bytes()
+            except (ValueError, FileNotFoundError) as error:
+                self._send_json(HTTPStatus.NOT_FOUND, {"error": str(error)})
+                return
+            self._send_download(
+                body,
+                "application/x-ndjson; charset=utf-8",
+                filename,
+            )
+
         def _reset_analytics(self) -> None:
             payload = self._confirmed_admin_payload("RESET ANALYTICS")
             if payload is None:
@@ -297,6 +384,12 @@ def create_request_handler(
             admin_service.reset_analytics()
             analytics.record(
                 "admin_action",
+                action="reset_analytics",
+                **self._request_metadata(),
+            )
+            log_event(
+                LOGGER,
+                "admin_action_completed",
                 action="reset_analytics",
                 **self._request_metadata(),
             )
@@ -310,6 +403,12 @@ def create_request_handler(
             admin_service.reset_popularity()
             analytics.record(
                 "admin_action",
+                action="reset_popularity",
+                **self._request_metadata(),
+            )
+            log_event(
+                LOGGER,
+                "admin_action_completed",
                 action="reset_popularity",
                 **self._request_metadata(),
             )
@@ -329,6 +428,13 @@ def create_request_handler(
                 "admin_action",
                 action="start_replacement_index_build",
                 target_directory=rebuild.get("target_directory"),
+                **self._request_metadata(),
+            )
+            log_event(
+                LOGGER,
+                "admin_action_started",
+                action="start_replacement_index_build",
+                rebuild=rebuild,
                 **self._request_metadata(),
             )
             self._send_json(
@@ -476,6 +582,21 @@ def create_request_handler(
         def log_message(self, format: str, *args: object) -> None:
             """Keep the local terminal focused on lifecycle messages."""
 
+        def log_request(
+            self,
+            code: int | str = "-",
+            size: int | str = "-",
+        ) -> None:
+            log_event(
+                LOGGER,
+                "http_request_completed",
+                method=self.command,
+                path=self.path,
+                status_code=code,
+                response_size=size,
+                **self._request_metadata(),
+            )
+
     return AutocompleteRequestHandler
 
 
@@ -535,6 +656,14 @@ def run_server(
         ranking_mode=system.ranking_mode.value,
         index_backend=type(system.index).__name__,
     )
+    log_event(
+        LOGGER,
+        "web_server_started",
+        host=host,
+        port=port,
+        ranking_mode=system.ranking_mode.value,
+        index_backend=type(system.index).__name__,
+    )
     server = create_server(system, host, port, analytics, admin_service)
     display_host = "localhost" if host in {"127.0.0.1", "localhost"} else host
     announce(f"Autocomplete website is ready at http://{display_host}:{server.server_port}")
@@ -546,12 +675,14 @@ def run_server(
     finally:
         server.server_close()
         analytics.record("server_stop")
+        log_event(LOGGER, "web_server_stopped", host=host, port=port)
         if system.data_directory is not None:
             system.save_usage_stats()
         system.close()
 
 
 def main() -> None:
+    configure_system_logging()
     args = parse_args()
     system = AutocompleteSystem.load(args.data_dir, args.mode)
     run_server(system, args.host, args.port)

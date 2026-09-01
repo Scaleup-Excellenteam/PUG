@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import logging
 import sqlite3
+import time
 from bisect import bisect_left
 from collections.abc import Callable, Sequence
 from pathlib import Path
 
 from .constants import MAX_NODE_CACHE_SIZE, SQLITE_INDEX_FILENAME
 from .models import SentenceRecord
+from .logging_config import log_event
 from .normalization import normalize_text
 from .sources import iter_source_lines
 from .sqlite_index import SQLiteSubstringIndex
@@ -16,6 +19,7 @@ from .trie import CompressedSuffixTrie
 
 ProgressCallback = Callable[[int], None]
 InputSources = Path | Sequence[Path]
+LOGGER = logging.getLogger("autocomplete.indexer")
 
 
 def _coerce_sources(sources: InputSources) -> tuple[Path, ...]:
@@ -43,6 +47,13 @@ def build_index(sources: InputSources) -> tuple[CompressedSuffixTrie, list[Sente
     construction cost makes it appropriate for small and medium corpora.
     """
 
+    started = time.perf_counter()
+    resolved_sources = _coerce_sources(sources)
+    log_event(
+        LOGGER,
+        "trie_build_started",
+        sources=[str(source) for source in resolved_sources],
+    )
     trie = CompressedSuffixTrie()
     master_array: list[SentenceRecord] = []
     length_keys: list[tuple[object, ...]] = []
@@ -54,7 +65,7 @@ def build_index(sources: InputSources) -> tuple[CompressedSuffixTrie, list[Sente
     def alphabetical_key(sentence_id: int) -> tuple[object, ...]:
         return alphabetical_keys[sentence_id]
 
-    for source_line in iter_source_lines(_coerce_sources(sources)):
+    for source_line in iter_source_lines(resolved_sources):
         normalized = normalize_text(source_line.original_text)
         sentence_id = len(master_array)
         master_array.append(
@@ -80,6 +91,13 @@ def build_index(sources: InputSources) -> tuple[CompressedSuffixTrie, list[Sente
         if normalized:
             trie.insert_sentence(normalized, sentence_id, length_key, alphabetical_key)
 
+    log_event(
+        LOGGER,
+        "trie_build_completed",
+        sources=[str(source) for source in resolved_sources],
+        sentence_count=len(master_array),
+        duration_ms=round((time.perf_counter() - started) * 1000, 3),
+    )
     return trie, master_array
 
 
@@ -160,6 +178,14 @@ def build_sqlite_index(
 ) -> tuple[SQLiteSubstringIndex, list[SentenceRecord]]:
     """Build the scalable disk-backed substring index atomically."""
 
+    started = time.perf_counter()
+    resolved_sources = _coerce_sources(sources)
+    log_event(
+        LOGGER,
+        "sqlite_index_build_started",
+        sources=[str(source) for source in resolved_sources],
+        data_directory=str(data_directory),
+    )
     data_directory.mkdir(parents=True, exist_ok=True)
     database_path = data_directory / SQLITE_INDEX_FILENAME
     temporary_path = database_path.with_suffix(database_path.suffix + ".tmp")
@@ -190,7 +216,7 @@ def build_sqlite_index(
         """
         pending_rows: list[tuple[object, ...]] = []
 
-        for source_line in iter_source_lines(_coerce_sources(sources)):
+        for source_line in iter_source_lines(resolved_sources):
             normalized = normalize_text(source_line.original_text)
             sentence_id = len(master_array)
             master_array.append(
@@ -251,6 +277,13 @@ def build_sqlite_index(
                 pending_rows.clear()
             if progress_callback is not None and (sentence_id + 1) % 100_000 == 0:
                 progress_callback(sentence_id + 1)
+            if (sentence_id + 1) % 100_000 == 0:
+                log_event(
+                    LOGGER,
+                    "sqlite_index_build_progress",
+                    sentence_count=sentence_id + 1,
+                    duration_seconds=round(time.perf_counter() - started, 3),
+                )
 
         if pending_rows:
             connection.executemany(insert_sql, pending_rows)
@@ -304,4 +337,13 @@ def build_sqlite_index(
         short_length_cache=short_length_cache,
     )
     index.attach(data_directory)
+    log_event(
+        LOGGER,
+        "sqlite_index_build_completed",
+        sources=[str(source) for source in resolved_sources],
+        data_directory=str(data_directory),
+        sentence_count=len(master_array),
+        alphabet_size=len(alphabet),
+        duration_seconds=round(time.perf_counter() - started, 3),
+    )
     return index, master_array

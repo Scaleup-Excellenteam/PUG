@@ -2,14 +2,20 @@
 
 from __future__ import annotations
 
+import logging
+import time
 from pathlib import Path
 
 from .constants import ALPHA
 from .models import AutoCompleteData, RankingMode, SentenceRecord
+from .logging_config import log_event
 from .normalization import normalize_text
 from .sqlite_index import SQLiteSubstringIndex
 from .storage import SearchIndex, load_index, save_usage_stats
 from autocomplete_system.error_cache import ErrorCache
+
+
+LOGGER = logging.getLogger("autocomplete.engine")
 
 
 class AutocompleteSystem:
@@ -41,8 +47,25 @@ class AutocompleteSystem:
         data_directory: Path,
         ranking_mode: RankingMode = RankingMode.ASSIGNMENT,
     ) -> AutocompleteSystem:
+        started = time.perf_counter()
+        log_event(
+            LOGGER,
+            "system_load_started",
+            data_directory=str(data_directory),
+            ranking_mode=ranking_mode.value,
+        )
         index, master_array = load_index(data_directory)
-        return cls(index, master_array, data_directory, ranking_mode)
+        system = cls(index, master_array, data_directory, ranking_mode)
+        log_event(
+            LOGGER,
+            "system_load_completed",
+            data_directory=str(data_directory),
+            ranking_mode=ranking_mode.value,
+            backend=type(index).__name__,
+            sentence_count=len(master_array),
+            duration_ms=round((time.perf_counter() - started) * 1000, 3),
+        )
+        return system
 
     def get_ranked_completions(
         self,
@@ -52,8 +75,20 @@ class AutocompleteSystem:
     ) -> list[tuple[int, AutoCompleteData]]:
         """Return result IDs and public completion records, best first."""
 
-        original_query = normalize_text(prefix)
-        if not original_query or k <= 0:
+        started = time.perf_counter()
+        normalized_query = normalize_text(prefix)
+        if not normalized_query or k <= 0:
+            log_event(
+                LOGGER,
+                "search_completed",
+                query=prefix,
+                normalized_query=normalized_query,
+                requested_k=k,
+                result_count=0,
+                results=[],
+                duration_ms=round((time.perf_counter() - started) * 1000, 3),
+                reason="empty_normalized_query_or_nonpositive_k",
+            )
             return []
 
         # Phase 1: Fast O(L) scan and replace via Aho-Corasick DFA
@@ -102,30 +137,28 @@ class AutocompleteSystem:
                     ),
                 )
             )
-
-        # Phase 2: Organic Learning (Asynchronous Write Path)
-        # If we didn't use the cache, but found a typo correction organically, submit it!
-        if original_query == normalized_query and results:
-            best_id, best_data = results[0]
-            # A score < 2*len means we used a 1-edit penalty to find it
-            if best_data.score < 2 * len(original_query):
-                record_norm = self.master_array[best_id].normalized_text
-                # Find which 1-edit variant successfully matched
-                from autocomplete_system.scoring import generate_scored_variants
-                # Use a basic english alphabet for recovery
-                alphabet = "abcdefghijklmnopqrstuvwxyz0123456789 "
-                variants = generate_scored_variants(original_query, alphabet)
-                
-                best_variant = None
-                best_variant_score = -1
-                for var, sc in variants.items():
-                    if sc > best_variant_score and var in record_norm:
-                        best_variant = var
-                        best_variant_score = sc
-                        
-                if best_variant:
-                    self.error_cache.submit_correction(original_query, best_variant)
-
+        log_event(
+            LOGGER,
+            "search_completed",
+            query=prefix,
+            normalized_query=normalized_query,
+            requested_k=k,
+            ranking_mode=mode.value,
+            backend=type(self.index).__name__,
+            candidate_count=len(text_scores),
+            result_count=len(results),
+            results=[
+                {
+                    "sentence_id": sentence_id,
+                    "completed_sentence": completion.completed_sentence,
+                    "source_text": completion.source_text,
+                    "offset": completion.offset,
+                    "score": completion.score,
+                }
+                for sentence_id, completion in results
+            ],
+            duration_ms=round((time.perf_counter() - started) * 1000, 3),
+        )
         return results
 
     def get_best_k_completions(self, prefix: str) -> list[AutoCompleteData]:
@@ -140,6 +173,16 @@ class AutocompleteSystem:
             raise IndexError(f"Unknown sentence ID: {sentence_id}")
         self.master_array[sentence_id].usage_count += 1
         self._has_usage_counts = True
+        record = self.master_array[sentence_id]
+        log_event(
+            LOGGER,
+            "selection_recorded",
+            sentence_id=sentence_id,
+            completed_sentence=record.original_text,
+            source_text=record.source_path,
+            offset=record.line_number,
+            usage_count=record.usage_count,
+        )
 
     def reset_usage_counts(self) -> None:
         """Reset every popularity counter without changing the search index."""
@@ -147,6 +190,11 @@ class AutocompleteSystem:
         for record in self.master_array:
             record.usage_count = 0
         self._has_usage_counts = False
+        log_event(
+            LOGGER,
+            "popularity_reset",
+            sentence_count=len(self.master_array),
+        )
 
     def save_usage_stats(self) -> None:
         """Persist popularity data when this system has a data directory."""
@@ -154,9 +202,15 @@ class AutocompleteSystem:
         if self.data_directory is None:
             raise ValueError("No data directory is configured for this system.")
         save_usage_stats(self.data_directory, self.master_array)
+        log_event(
+            LOGGER,
+            "usage_stats_saved",
+            data_directory=str(self.data_directory),
+        )
 
     def close(self) -> None:
         """Release resources held by a disk-backed index."""
 
         if isinstance(self.index, SQLiteSubstringIndex):
             self.index.close()
+        log_event(LOGGER, "system_closed", backend=type(self.index).__name__)

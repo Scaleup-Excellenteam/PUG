@@ -32,7 +32,34 @@ class WebApplicationTests(unittest.TestCase):
             ranking_mode=RankingMode.POPULARITY,
         )
         self.analytics = AnalyticsStore(root / "web-data")
-        self.admin_service = AdminService(self.system, self.analytics, Path.cwd())
+        logs = root / "logs"
+        logs.mkdir()
+        (logs / "system.jsonl").write_text(
+            "\n".join(
+                json.dumps(event)
+                for event in (
+                    {
+                        "timestamp": "2026-01-01T00:00:00+00:00",
+                        "level": "INFO",
+                        "logger": "autocomplete.engine",
+                        "event": "search_completed",
+                        "message": "search completed",
+                        "details": {"query": "demo"},
+                    },
+                    {
+                        "timestamp": "2026-01-01T00:00:01+00:00",
+                        "level": "ERROR",
+                        "logger": "autocomplete.web",
+                        "event": "web_search_failed",
+                        "message": "search failed",
+                        "details": {"query": "broken"},
+                    },
+                )
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        self.admin_service = AdminService(self.system, self.analytics, root)
         self.server = create_server(
             self.system,
             port=0,
@@ -139,11 +166,36 @@ class WebApplicationTests(unittest.TestCase):
             html = response.read().decode("utf-8")
         self.assertIn("Autocomplete overview", html)
         self.assertIn("Administrative actions", html)
+        self.assertIn("Live system logs", html)
 
         with urlopen(self.base_url + "/api/admin/export?format=json", timeout=2) as response:
             exported = json.loads(response.read().decode("utf-8"))
             self.assertIn("attachment", response.headers["Content-Disposition"])
         self.assertEqual(exported["events"][0]["event_type"], "search")
+
+    def test_admin_log_viewer_filters_downloads_and_blocks_unknown_paths(self) -> None:
+        files = self.read_json("/api/admin/log-files")
+        self.assertEqual(files["files"][0]["filename"], "system.jsonl")
+
+        logs = self.read_json("/api/admin/logs?file=system.jsonl&level=ERROR&limit=50")
+        self.assertEqual(logs["record_count"], 1)
+        self.assertEqual(logs["records"][0]["event"], "web_search_failed")
+        self.assertEqual(logs["records"][0]["details"]["query"], "broken")
+
+        with urlopen(
+            self.base_url + "/api/admin/logs/download?file=system.jsonl",
+            timeout=2,
+        ) as response:
+            body = response.read().decode("utf-8")
+            self.assertIn("attachment", response.headers["Content-Disposition"])
+        self.assertIn("search_completed", body)
+
+        with self.assertRaises(HTTPError) as context:
+            urlopen(
+                self.base_url + "/api/admin/logs?file=../README.md&limit=50",
+                timeout=2,
+            )
+        self.assertEqual(context.exception.code, 404)
 
     def test_admin_resets_require_confirmation_and_reset_popularity(self) -> None:
         self.post_json("/api/select", {"sentence_id": 0, "query": "hello"})

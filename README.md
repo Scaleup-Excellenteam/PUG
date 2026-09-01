@@ -123,6 +123,37 @@ Replacement builds are created under `rebuilds/` and never overwrite or
 activate the live index automatically. Reset buttons require their displayed
 confirmation phrase exactly to guard against accidental data loss.
 
+## Real-time operational logs
+
+`logs/system.jsonl` is the separate operational log for the complete system.
+It uses UTF-8 JSON Lines and is flushed after every event. Records include UTC
+time, severity, component, process/thread information, event name, and complete
+event details. Search records deliberately include the full original and
+normalized query plus the complete returned sentences, sources, offsets,
+scores, IDs, timing, ranking mode, and backend.
+
+The log covers system/index loading, searches, selections, popularity, usage
+storage, HTTP requests, client and voice events, Admin operations, CLI input,
+source-file processing, Trie/SQLite builds and progress, benchmarks, shutdown,
+and uncaught main-thread or worker-thread failures.
+
+Rotation occurs automatically when the active file reaches 10 MiB. Five
+backups are retained as `system.jsonl.1` through `system.jsonl.5`; the oldest is
+removed by the standard-library rotating handler. This bounds operational-log
+storage to approximately 60 MiB including the active file. These logs contain
+full user text and should therefore remain local and must not be committed.
+
+`data/analytics_events.jsonl` remains separate: it is the durable user-activity
+and dashboard audit trail, while `logs/system.jsonl` is intended for debugging,
+operations, errors, and end-to-end tracing.
+
+The Admin dashboard includes a live operational Log Viewer. It polls without
+holding an HTTP connection open, can pause/resume automatic refresh, select the
+active file or any retained rotation backup, show 50/200/500 recent records,
+filter by severity and component, search through the complete JSON payload,
+expand an event's formatted JSON, and download the selected file. The server
+accepts only the configured `system.jsonl` names and rejects arbitrary paths.
+
 ## Python API
 
 ```python

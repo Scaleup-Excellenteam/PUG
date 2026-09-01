@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import logging
 import time
 from pathlib import Path
 
@@ -11,7 +12,11 @@ from autocomplete_system.constants import (
     DEFAULT_INPUT_SOURCES,
 )
 from autocomplete_system.indexer import build_index, build_sqlite_index
+from autocomplete_system.logging_config import configure_system_logging, log_event
 from autocomplete_system.storage import save_index
+
+
+LOGGER = logging.getLogger("autocomplete.build_cli")
 
 
 def parse_args() -> argparse.Namespace:
@@ -45,9 +50,17 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    configure_system_logging()
     args = parse_args()
     sources = tuple(args.sources) if args.sources else DEFAULT_INPUT_SOURCES
     started = time.perf_counter()
+    log_event(
+        LOGGER,
+        "offline_build_started",
+        sources=[str(source) for source in sources],
+        data_directory=str(args.data_dir),
+        backend=args.backend,
+    )
 
     if args.backend == "sqlite":
         print("Building the scalable substring index...", flush=True)
@@ -77,6 +90,15 @@ def main() -> None:
     print(
         f"Indexed {len(master_array):,} sentences into {args.data_dir} "
         f"using {args.backend} in {elapsed:.1f}s."
+    )
+    log_event(
+        LOGGER,
+        "offline_build_completed",
+        sources=[str(source) for source in sources],
+        data_directory=str(args.data_dir),
+        backend=args.backend,
+        sentence_count=len(master_array),
+        duration_seconds=round(elapsed, 3),
     )
 
 

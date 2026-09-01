@@ -24,6 +24,11 @@ from .constants import (
     MAX_NODE_CACHE_SIZE,
 )
 from .engine import AutocompleteSystem
+from .logging_config import (
+    DEFAULT_LOG_BACKUP_COUNT,
+    DEFAULT_MAX_LOG_BYTES,
+    SYSTEM_LOG_FILENAME,
+)
 
 
 def utc_now() -> str:
@@ -461,20 +466,30 @@ class AdminService:
 
     def _storage(self) -> list[dict[str, object]]:
         data_directory = self.system.data_directory
-        if data_directory is None or not data_directory.exists():
-            return []
         files: list[dict[str, object]] = []
-        for path in sorted(item for item in data_directory.iterdir() if item.is_file()):
-            stat = path.stat()
-            files.append(
-                {
-                    "name": path.name,
-                    "bytes": stat.st_size,
-                    "modified_at": datetime.fromtimestamp(
-                        stat.st_mtime, timezone.utc
-                    ).isoformat(timespec="seconds"),
-                }
-            )
+        locations = []
+        if data_directory is not None:
+            locations.append(("data", data_directory))
+        locations.append(("logs", self.project_directory / "logs"))
+        seen: set[Path] = set()
+        for label, directory in locations:
+            if not directory.exists():
+                continue
+            for path in sorted(item for item in directory.iterdir() if item.is_file()):
+                resolved = path.resolve()
+                if resolved in seen:
+                    continue
+                seen.add(resolved)
+                stat = path.stat()
+                files.append(
+                    {
+                        "name": f"{label}/{path.name}",
+                        "bytes": stat.st_size,
+                        "modified_at": datetime.fromtimestamp(
+                            stat.st_mtime, timezone.utc
+                        ).isoformat(timespec="seconds"),
+                    }
+                )
         return files
 
     def dashboard(self) -> dict[str, object]:
@@ -499,6 +514,11 @@ class AdminService:
                 if self.system.data_directory
                 else None,
                 "analytics_file": str(self.analytics.path),
+                "system_log_file": str(
+                    self.project_directory / "logs" / SYSTEM_LOG_FILENAME
+                ),
+                "system_log_max_bytes": DEFAULT_MAX_LOG_BYTES,
+                "system_log_backup_count": DEFAULT_LOG_BACKUP_COUNT,
             },
             "corpus": corpus,
             "storage": self._storage(),
@@ -524,6 +544,101 @@ class AdminService:
                 }
             )
         return {"offset": start, "limit": limit, "total": total, "records": records}
+
+    def _allowed_log_names(self) -> tuple[str, ...]:
+        return (SYSTEM_LOG_FILENAME,) + tuple(
+            f"{SYSTEM_LOG_FILENAME}.{number}"
+            for number in range(1, DEFAULT_LOG_BACKUP_COUNT + 1)
+        )
+
+    def resolve_log_file(self, filename: str) -> Path:
+        """Resolve only the active log or one configured rotation backup."""
+
+        if filename not in self._allowed_log_names():
+            raise ValueError("Unknown operational log file.")
+        path = (self.project_directory / "logs" / filename).resolve()
+        expected_parent = (self.project_directory / "logs").resolve()
+        if path.parent != expected_parent or not path.is_file():
+            raise FileNotFoundError(f"Operational log file not found: {filename}")
+        return path
+
+    def log_files(self) -> list[dict[str, object]]:
+        files = []
+        for filename in self._allowed_log_names():
+            try:
+                path = self.resolve_log_file(filename)
+            except FileNotFoundError:
+                continue
+            stat = path.stat()
+            files.append(
+                {
+                    "filename": filename,
+                    "active": filename == SYSTEM_LOG_FILENAME,
+                    "bytes": stat.st_size,
+                    "modified_at": datetime.fromtimestamp(
+                        stat.st_mtime, timezone.utc
+                    ).isoformat(timespec="milliseconds"),
+                }
+            )
+        return files
+
+    def read_system_logs(
+        self,
+        filename: str,
+        limit: int,
+        level: str = "",
+        component: str = "",
+        search: str = "",
+    ) -> dict[str, object]:
+        """Return filtered recent structured records, newest first."""
+
+        path = self.resolve_log_file(filename)
+        raw_lines = path.read_bytes().splitlines()[-5000:]
+        normalized_level = level.upper().strip()
+        normalized_component = component.casefold().strip()
+        normalized_search = search.casefold().strip()
+        records: list[dict[str, Any]] = []
+        malformed_lines = 0
+        for raw_line in reversed(raw_lines):
+            try:
+                event = json.loads(raw_line.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                malformed_lines += 1
+                continue
+            if not isinstance(event, dict):
+                malformed_lines += 1
+                continue
+            if normalized_level and str(event.get("level", "")).upper() != normalized_level:
+                continue
+            if normalized_component and normalized_component not in str(
+                event.get("logger", "")
+            ).casefold():
+                continue
+            if normalized_search and normalized_search not in json.dumps(
+                event, ensure_ascii=False, default=str
+            ).casefold():
+                continue
+            records.append(event)
+            if len(records) >= limit:
+                break
+        stat = path.stat()
+        return {
+            "filename": filename,
+            "bytes": stat.st_size,
+            "modified_at": datetime.fromtimestamp(
+                stat.st_mtime, timezone.utc
+            ).isoformat(timespec="milliseconds"),
+            "scanned_lines": len(raw_lines),
+            "malformed_lines": malformed_lines,
+            "record_count": len(records),
+            "records": records,
+            "filters": {
+                "level": normalized_level,
+                "component": component,
+                "search": search,
+                "limit": limit,
+            },
+        }
 
     def reset_analytics(self) -> None:
         self.analytics.clear()
