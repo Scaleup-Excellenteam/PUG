@@ -41,11 +41,24 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--no-keymap",
+        action="store_false",
+        dest="keymap",
+        default=True,
+        help="Disable automatic keyboard layout remapping (enabled by default).",
+    )
+    parser.add_argument(
+        "--translate",
+        action="store_true",
+        default=False,
+        help="Enable token-level Google translation (disabled by default).",
+    )
+    parser.add_argument(
         "--adaptation-mode",
         type=str,
         choices=[m.value for m in AdaptationMode],
-        default=AdaptationMode.OFF.value,
-        help="Input adaptation mode: off, translate, or keymap (default: off).",
+        default=None,
+        help="Legacy input adaptation mode: off, translate, or keymap.",
     )
     parser.add_argument(
         "--sigma-policy",
@@ -71,7 +84,8 @@ def run_cli(
 
     if pipeline is None:
         pipeline = InputAdaptationPipeline(
-            mode=AdaptationMode.OFF,
+            enable_keymap=True,
+            enable_translate=False,
             sigma_policy=SigmaPolicy.WARN,
         )
 
@@ -82,7 +96,8 @@ def run_cli(
         "cli_started",
         ranking_mode=system.ranking_mode.value,
         backend=type(system.index).__name__,
-        adaptation_mode=pipeline.mode.value,
+        keymap_enabled=pipeline.enable_keymap,
+        translate_enabled=pipeline.enable_translate,
         sigma_policy=pipeline.sigma_policy.value,
     )
     print(READY_PROMPT)
@@ -97,21 +112,13 @@ def run_cli(
             if user_input.startswith(":"):
                 cmd = user_input.strip().lower()
                 if cmd == ":translate":
-                    new_mode = (
-                        AdaptationMode.OFF
-                        if pipeline.mode is AdaptationMode.TRANSLATE
-                        else AdaptationMode.TRANSLATE
-                    )
-                    pipeline.set_mode(new_mode)
-                    print(f"[Config] Adaptation mode set to: {new_mode.value}")
+                    enabled = pipeline.toggle_translate()
+                    state = "ENABLED" if enabled else "DISABLED"
+                    print(f"[Config] Token-level translation: {state}")
                 elif cmd == ":keymap":
-                    new_mode = (
-                        AdaptationMode.OFF
-                        if pipeline.mode is AdaptationMode.KEYBOARD_REMAP
-                        else AdaptationMode.KEYBOARD_REMAP
-                    )
-                    pipeline.set_mode(new_mode)
-                    print(f"[Config] Adaptation mode set to: {new_mode.value}")
+                    enabled = pipeline.toggle_keymap()
+                    state = "ENABLED" if enabled else "DISABLED"
+                    print(f"[Config] Keyboard remapping: {state}")
                 elif cmd == ":sigma":
                     next_policy = {
                         SigmaPolicy.WARN: SigmaPolicy.BLOCK,
@@ -121,16 +128,19 @@ def run_cli(
                     pipeline.set_sigma_policy(next_policy)
                     print(f"[Config] Sigma policy set to: {next_policy.value}")
                 elif cmd == ":status":
+                    km_str = "ON" if pipeline.enable_keymap else "OFF"
+                    tr_str = "ON" if pipeline.enable_translate else "OFF"
                     print(
-                        f"[Status] Adaptation mode: {pipeline.mode.value} | "
+                        f"[Status] Keyboard remap: {km_str} | "
+                        f"Translation: {tr_str} | "
                         f"Sigma policy: {pipeline.sigma_policy.value}"
                     )
                 elif cmd in (":help", ":?"):
                     print(
                         "Interactive commands:\n"
                         "  #          Select top suggestion and reset query\n"
-                        "  :translate Toggle token-level translation\n"
-                        "  :keymap    Toggle Hebrew->QWERTY layout remapping\n"
+                        "  :keymap    Toggle Hebrew->QWERTY layout remapping (ON by default)\n"
+                        "  :translate Toggle token-level translation (OFF by default)\n"
                         "  :sigma     Cycle Sigma policy (warn -> block -> off)\n"
                         "  :status    Display active adaptation settings\n"
                         "  :help      Show this help message"
@@ -218,17 +228,31 @@ def main() -> None:
     configure_system_logging()
     args = parse_args()
     system = AutocompleteSystem.load(args.data_dir, args.mode)
+
+    keymap_enabled = getattr(args, "keymap", True)
+    translate_enabled = getattr(args, "translate", False)
     adaptation_mode = getattr(args, "adaptation_mode", None)
-    sigma_policy = getattr(args, "sigma_policy", None)
+    if adaptation_mode is not None:
+        if adaptation_mode == AdaptationMode.OFF.value:
+            keymap_enabled = False
+            translate_enabled = False
+        elif adaptation_mode == AdaptationMode.KEYBOARD_REMAP.value:
+            keymap_enabled = True
+        elif adaptation_mode == AdaptationMode.TRANSLATE.value:
+            translate_enabled = True
+
+    sigma_policy = getattr(args, "sigma_policy", SigmaPolicy.WARN.value)
     keymap_file = getattr(args, "keymap_file", None)
 
     if (
-        (adaptation_mode and adaptation_mode != AdaptationMode.OFF.value)
+        not keymap_enabled
+        or translate_enabled
         or (sigma_policy and sigma_policy != SigmaPolicy.WARN.value)
         or keymap_file
     ):
         pipeline = InputAdaptationPipeline(
-            mode=AdaptationMode(adaptation_mode or AdaptationMode.OFF.value),
+            enable_keymap=keymap_enabled,
+            enable_translate=translate_enabled,
             sigma_policy=SigmaPolicy(sigma_policy or SigmaPolicy.WARN.value),
         )
         if keymap_file:

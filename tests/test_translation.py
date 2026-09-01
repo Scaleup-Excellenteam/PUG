@@ -174,9 +174,25 @@ class TokenTranslatorTests(unittest.TestCase):
 class InputAdaptationPipelineTests(unittest.TestCase):
     """Test pipeline coordinating translation, remapping, and Sigma guard."""
 
+    def test_pipeline_default_remaps_hebrew_layout_out_of_the_box(self) -> None:
+        pipeline = InputAdaptationPipeline()
+        # Out of the box with defaults:
+        self.assertTrue(pipeline.enable_keymap)
+        self.assertFalse(pipeline.enable_translate)
+        self.assertEqual(pipeline.sigma_policy, SigmaPolicy.WARN)
+
+        result = pipeline.process("יקךךם")
+        self.assertEqual(result.final_query, "hello")
+        self.assertTrue(result.was_adapted)
+        self.assertTrue(result.keymap_applied)
+        self.assertFalse(result.is_blocked)
+        self.assertEqual(result.sigma_violations, [])
+        self.assertIsNone(result.warning_message)
+
     def test_pipeline_off_mode_keeps_original(self) -> None:
         pipeline = InputAdaptationPipeline(
-            mode=AdaptationMode.OFF,
+            enable_keymap=False,
+            enable_translate=False,
             sigma_policy=SigmaPolicy.OFF,
         )
         result = pipeline.process("שלום world")
@@ -186,7 +202,8 @@ class InputAdaptationPipelineTests(unittest.TestCase):
 
     def test_pipeline_keyboard_remap_mode(self) -> None:
         pipeline = InputAdaptationPipeline(
-            mode=AdaptationMode.KEYBOARD_REMAP,
+            enable_keymap=True,
+            enable_translate=False,
             sigma_policy=SigmaPolicy.BLOCK,
         )
         result = pipeline.process("יקךךם")
@@ -202,7 +219,8 @@ class InputAdaptationPipelineTests(unittest.TestCase):
 
         translator = TokenTranslator(custom_translate_fn=mock_translate)
         pipeline = InputAdaptationPipeline(
-            mode=AdaptationMode.TRANSLATE,
+            enable_keymap=False,
+            enable_translate=True,
             sigma_policy=SigmaPolicy.BLOCK,
             translator=translator,
         )
@@ -215,7 +233,8 @@ class InputAdaptationPipelineTests(unittest.TestCase):
 
     def test_pipeline_blocks_untranslated_foreign_when_guard_is_block(self) -> None:
         pipeline = InputAdaptationPipeline(
-            mode=AdaptationMode.OFF,
+            enable_keymap=False,
+            enable_translate=False,
             sigma_policy=SigmaPolicy.BLOCK,
         )
         result = pipeline.process("שלום world")
@@ -243,7 +262,7 @@ class AutocompleteEngineIntegrationTests(unittest.TestCase):
 
     def test_keyboard_remap_enables_search(self) -> None:
         pipeline = InputAdaptationPipeline(
-            mode=AdaptationMode.KEYBOARD_REMAP,
+            enable_keymap=True,
             sigma_policy=SigmaPolicy.OFF,
         )
         # User meant "hello" but typed "יקךךם" on Hebrew keyboard
@@ -260,7 +279,8 @@ class AutocompleteEngineIntegrationTests(unittest.TestCase):
 
         translator = TokenTranslator(custom_translate_fn=mock_translate)
         pipeline = InputAdaptationPipeline(
-            mode=AdaptationMode.TRANSLATE,
+            enable_keymap=False,
+            enable_translate=True,
             sigma_policy=SigmaPolicy.OFF,
             translator=translator,
         )
@@ -292,10 +312,7 @@ class CliAdaptationTests(unittest.TestCase):
         self.temporary_directory.cleanup()
 
     def test_cli_interactive_toggles(self) -> None:
-        pipeline = InputAdaptationPipeline(
-            mode=AdaptationMode.OFF,
-            sigma_policy=SigmaPolicy.WARN,
-        )
+        pipeline = InputAdaptationPipeline()
         output = StringIO()
         # Feed commands: :translate, :keymap, :sigma, :status, then EOFError
         with patch("builtins.input", side_effect=[":translate", ":keymap", ":sigma", ":status", EOFError]):
@@ -303,14 +320,14 @@ class CliAdaptationTests(unittest.TestCase):
                 run_cli(self.system, pipeline)
 
         rendered = output.getvalue()
-        self.assertIn("[Config] Adaptation mode set to: translate", rendered)
-        self.assertIn("[Config] Adaptation mode set to: keymap", rendered)
+        self.assertIn("[Config] Token-level translation: ENABLED", rendered)
+        self.assertIn("[Config] Keyboard remapping: DISABLED", rendered)
         self.assertIn("[Config] Sigma policy set to: block", rendered)
         self.assertIn("[Status]", rendered)
 
     def test_cli_blocks_foreign_when_policy_is_block(self) -> None:
         pipeline = InputAdaptationPipeline(
-            mode=AdaptationMode.OFF,
+            enable_keymap=False,
             sigma_policy=SigmaPolicy.BLOCK,
         )
         output = StringIO()
@@ -324,7 +341,7 @@ class CliAdaptationTests(unittest.TestCase):
 
     def test_cli_warns_and_proceeds_when_user_confirms(self) -> None:
         pipeline = InputAdaptationPipeline(
-            mode=AdaptationMode.OFF,
+            enable_keymap=False,
             sigma_policy=SigmaPolicy.WARN,
         )
         output = StringIO()
@@ -336,20 +353,17 @@ class CliAdaptationTests(unittest.TestCase):
         rendered = output.getvalue()
         self.assertIn("[Warning]", rendered)
 
-    def test_cli_remaps_hebrew_keystrokes_with_keymap_mode(self) -> None:
-        pipeline = InputAdaptationPipeline(
-            mode=AdaptationMode.KEYBOARD_REMAP,
-            sigma_policy=SigmaPolicy.BLOCK,
-        )
+    def test_cli_default_remaps_hebrew_keystrokes_without_prompt(self) -> None:
         output = StringIO()
-        # User types "יקךךם" (hello on Hebrew keyboard), which gets adapted and completes
+        # By default out-of-the-box (no pipeline passed), typing "יקךךם" auto-remaps to "hello"
         with patch("builtins.input", side_effect=["יקךךם", EOFError]):
             with redirect_stdout(output):
-                run_cli(self.system, pipeline)
+                run_cli(self.system)
 
         rendered = output.getvalue()
         self.assertIn("[Adapted]: 'יקךךם' -> 'hello'", rendered)
         self.assertIn("1. Hello, world!", rendered)
+        self.assertNotIn("[Warning]", rendered)
 
 
 if __name__ == "__main__":

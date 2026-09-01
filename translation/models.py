@@ -40,6 +40,8 @@ class QueryAdaptationResult:
     original_query: str
     final_query: str
     was_adapted: bool = False
+    keymap_applied: bool = False
+    translation_applied: bool = False
     mode: AdaptationMode = AdaptationMode.OFF
     tokens: list[TokenAdaptation] = field(default_factory=list)
     detected_languages: list[str] = field(default_factory=list)

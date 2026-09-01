@@ -34,6 +34,24 @@ class AutocompleteSystem:
         self.ranking_mode = ranking_mode
         self._has_usage_counts = any(record.usage_count for record in master_array)
         self.error_cache = ErrorCache()
+        self._search_count = 0
+        # Call on activation for demonstration
+        self._run_error_cache_worker(trigger="activation")
+
+    def _run_error_cache_worker(self, trigger: str) -> None:
+        """Execute an error cache background cycle with operational logging."""
+        started = time.perf_counter()
+        queued_items = len(self.error_cache.queue)
+        self.error_cache.rebuild_cycle()
+        log_event(
+            LOGGER,
+            "error_cache_worker_executed",
+            trigger=trigger,
+            search_count=self._search_count,
+            queued_items=queued_items,
+            cache_size=len(self.error_cache.cache),
+            duration_ms=round((time.perf_counter() - started) * 1000, 3),
+        )
 
     @property
     def trie(self) -> SearchIndex:
@@ -194,6 +212,12 @@ class AutocompleteSystem:
 
                 if best_variant:
                     self.error_cache.submit_correction(normalized_query, best_variant)
+
+        # TODO - implement: periodic timed cycle will be determined later;
+        # using a 10-call cycle for demonstration.
+        self._search_count += 1
+        if self._search_count % 10 == 0:
+            self._run_error_cache_worker(trigger="10_call_cycle")
 
         return results
 
