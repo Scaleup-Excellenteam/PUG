@@ -1,6 +1,7 @@
 "use strict";
 
 const input = document.querySelector("#search-input");
+const ghostInput = document.querySelector("#search-ghost");
 const clearButton = document.querySelector("#clear-button");
 const voiceButton = document.querySelector("#voice-button");
 const loadingIndicator = document.querySelector("#loading-indicator");
@@ -16,6 +17,7 @@ let suggestions = [];
 let activeIndex = -1;
 let debounceTimer = null;
 let currentRequest = null;
+let nextWordRequest = null;
 let speechRecognition = null;
 let isListening = false;
 let voiceRecognitionFailed = false;
@@ -175,12 +177,42 @@ async function fetchSuggestions(query, inputMethod = "typed") {
   }
 }
 
+async function fetchNextWord(query) {
+  if (nextWordRequest) {
+    nextWordRequest.abort();
+  }
+  nextWordRequest = new AbortController();
+
+  try {
+    const response = await fetch(
+      `/api/next_word?query=${encodeURIComponent(query)}`,
+      { signal: nextWordRequest.signal },
+    );
+    if (!response.ok) {
+      throw new Error("Next-word request failed");
+    }
+    const payload = await response.json();
+    if (input.value === query) {
+      ghostInput.value = payload.next_word ? `${query}${payload.next_word}` : "";
+      ghostInput.scrollLeft = input.scrollLeft;
+    }
+  } catch (error) {
+    if (error.name !== "AbortError" && input.value === query) {
+      ghostInput.value = "";
+    }
+  }
+}
+
 function scheduleSearch() {
   const query = input.value;
   lastInputMethod = "typed";
   clearButton.hidden = query.length === 0;
   selectionCard.hidden = true;
   clearTimeout(debounceTimer);
+  ghostInput.value = "";
+  if (nextWordRequest) {
+    nextWordRequest.abort();
+  }
 
   if (query.trim().length === 0) {
     if (currentRequest) {
@@ -198,7 +230,10 @@ function scheduleSearch() {
     return;
   }
 
-  debounceTimer = window.setTimeout(() => fetchSuggestions(query, "typed"), 120);
+  debounceTimer = window.setTimeout(() => {
+    fetchSuggestions(query, "typed");
+    fetchNextWord(query);
+  }, 120);
 }
 
 function setListening(listening) {
@@ -259,6 +294,7 @@ function configureVoiceSearch() {
       transcript += event.results[index][0].transcript;
     }
     input.value = transcript.trim();
+    ghostInput.value = "";
     clearButton.hidden = input.value.length === 0;
     searchStatus.textContent = input.value
       ? `Listening… “${input.value}”`
@@ -284,6 +320,7 @@ function configureVoiceSearch() {
     if (input.value.trim().length > 0) {
       clearTimeout(debounceTimer);
       fetchSuggestions(input.value, "voice");
+      fetchNextWord(input.value);
     } else if (!voiceRecognitionFailed) {
       searchStatus.textContent = "Voice search ended without a result.";
     }
@@ -298,6 +335,10 @@ function configureVoiceSearch() {
     if (currentRequest) {
       currentRequest.abort();
     }
+    if (nextWordRequest) {
+      nextWordRequest.abort();
+    }
+    ghostInput.value = "";
     clearTimeout(debounceTimer);
     suggestions = [];
     suggestionList.replaceChildren();
@@ -336,6 +377,7 @@ async function selectSuggestion(index) {
     selectedSource.textContent = `${payload.selected.source_text}:${payload.selected.offset} · selected ${payload.selected.usage_count} time${payload.selected.usage_count === 1 ? "" : "s"}`;
     selectionCard.hidden = false;
     input.value = "";
+    ghostInput.value = "";
     clearButton.hidden = true;
     suggestions = [];
     suggestionList.replaceChildren();
@@ -349,6 +391,10 @@ async function selectSuggestion(index) {
 
 input.addEventListener("input", scheduleSearch);
 
+input.addEventListener("scroll", () => {
+  ghostInput.scrollLeft = input.scrollLeft;
+});
+
 input.addEventListener("focus", () => {
   if (suggestions.length > 0) {
     setOpen(true);
@@ -356,6 +402,18 @@ input.addEventListener("focus", () => {
 });
 
 input.addEventListener("keydown", (event) => {
+  if (
+    event.key === "Tab"
+    && ghostInput.value.length > input.value.length
+    && ghostInput.value.startsWith(input.value)
+  ) {
+    event.preventDefault();
+    input.value = ghostInput.value;
+    ghostInput.value = "";
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    return;
+  }
+
   if (event.key === "ArrowDown" && suggestions.length > 0) {
     event.preventDefault();
     activeIndex = (activeIndex + 1) % suggestions.length;

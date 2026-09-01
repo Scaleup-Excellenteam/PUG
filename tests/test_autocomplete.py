@@ -60,6 +60,64 @@ class AutocompleteTests(unittest.TestCase):
         self.assertEqual(result.completed_sentence, "This is a demo.")
         self.assertEqual(result.score, 12)
 
+    def test_next_word_completes_the_current_word_then_predicts_after_space(self) -> None:
+        with patch.object(
+            self.system,
+            "get_best_k_completions",
+            wraps=self.system.get_best_k_completions,
+        ) as search:
+            self.assertEqual(self.system.get_next_word("Thi"), "s")
+        search.assert_called_once_with("Thi", k=MAX_NODE_CACHE_SIZE)
+
+        self.assertIsNone(self.system.get_next_word("This"))
+        self.assertEqual(self.system.get_next_word("This "), "is")
+        self.assertEqual(self.system.get_next_word("This i"), "s")
+        self.assertIsNone(self.system.get_next_word("useful "))
+        self.assertIsNone(self.system.get_next_word(""))
+        self.assertIsNone(self.system.get_next_word("not present"))
+
+    def test_next_word_skips_exact_standalone_lines_to_find_a_completion(self) -> None:
+        corpus = self.root / "next-word-standalone"
+        corpus.mkdir()
+        (corpus / "standalone.txt").write_text(
+            "DE\nDE\nDE\ndemo\n",
+            encoding="utf-8",
+        )
+        index, master = build_index(corpus)
+        system = AutocompleteSystem(index, master)
+        self.systems_to_close.append(system)
+
+        self.assertEqual(system.get_next_word("de"), "mo")
+
+    def test_space_requires_a_new_word_instead_of_splitting_a_longer_word(self) -> None:
+        corpus = self.root / "next-word-boundary"
+        corpus.mkdir()
+        (corpus / "boundary.txt").write_text(
+            "debecho\ndebe next\n",
+            encoding="utf-8",
+        )
+        index, master = build_index(corpus)
+        system = AutocompleteSystem(index, master)
+        self.systems_to_close.append(system)
+
+        self.assertEqual(system.get_next_word("debe"), "cho")
+        self.assertEqual(system.get_next_word("debe "), "next")
+
+    def test_next_word_uses_full_context_and_the_first_ambiguous_occurrence(self) -> None:
+        corpus = self.root / "next-word-context"
+        corpus.mkdir()
+        (corpus / "context.txt").write_text(
+            "Go home and go outside.\n",
+            encoding="utf-8",
+        )
+        index, master = build_index(corpus)
+        system = AutocompleteSystem(index, master)
+        self.systems_to_close.append(system)
+
+        self.assertEqual(system.get_next_word("go "), "home")
+        self.assertEqual(system.get_next_word("and go "), "outside")
+        self.assertEqual(system.get_next_word("go home and go "), "outside")
+
     def test_substitution_has_position_penalty(self) -> None:
         result = self.system.get_best_k_completions("hxllo")[0]
         self.assertEqual(result.completed_sentence, "Hello, world!")

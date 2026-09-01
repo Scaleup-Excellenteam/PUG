@@ -32,19 +32,22 @@
           <div class="search-row">
             <span class="search-icon" aria-hidden="true"></span>
             <label class="visually-hidden" for="search-input">Search sentences</label>
-            <input
-              id="search-input"
-              type="search"
-              name="query"
-              placeholder="Start typing to search"
-              autocomplete="off"
-              autocapitalize="off"
-              spellcheck="false"
-              aria-autocomplete="list"
-              aria-controls="suggestions"
-              aria-expanded="false"
-              aria-activedescendant=""
-            >
+            <div class="search-input-stack">
+              <input id="search-ghost" type="text" disabled tabindex="-1" aria-hidden="true">
+              <input
+                id="search-input"
+                type="search"
+                name="query"
+                placeholder="Start typing to search"
+                autocomplete="off"
+                autocapitalize="off"
+                spellcheck="false"
+                aria-autocomplete="list"
+                aria-controls="suggestions"
+                aria-expanded="false"
+                aria-activedescendant=""
+              >
+            </div>
             <button id="clear-button" class="clear-button" type="button" aria-label="Clear search" hidden>×</button>
             <button
               id="voice-button"

@@ -74,6 +74,10 @@ def create_request_handler(
 
         def do_GET(self) -> None:  # noqa: N802 - required by BaseHTTPRequestHandler
             request = urlsplit(self.path)
+            if request.path == "/api/next_word":
+                parameters = parse_qs(request.query)
+                self._serve_next_word(parameters.get("query", [""])[0])
+                return
             if request.path == "/api/suggestions":
                 parameters = parse_qs(request.query)
                 self._serve_suggestions(
@@ -108,6 +112,27 @@ def create_request_handler(
                 )
                 return
             self._serve_static_file(static_name)
+
+        def _serve_next_word(self, query: str) -> None:
+            try:
+                next_word = system.get_next_word(query)
+            except Exception as error:
+                log_event(
+                    LOGGER,
+                    "next_word_prediction_failed",
+                    level=logging.ERROR,
+                    query=query,
+                    error_type=type(error).__name__,
+                    error_message=str(error),
+                    exc_info=True,
+                    **self._request_metadata(),
+                )
+                self._send_json(
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    {"error": "The next-word prediction could not be completed."},
+                )
+                return
+            self._send_json(HTTPStatus.OK, {"next_word": next_word})
 
         def _drain_body(self) -> None:
             try:

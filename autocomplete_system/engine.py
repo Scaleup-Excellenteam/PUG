@@ -6,7 +6,7 @@ import logging
 import time
 from pathlib import Path
 
-from .constants import ALPHA
+from .constants import ALPHA, MAX_NODE_CACHE_SIZE
 from .models import AutoCompleteData, RankingMode, SentenceRecord
 from .logging_config import log_event
 from .normalization import normalize_text
@@ -221,10 +221,63 @@ class AutocompleteSystem:
 
         return results
 
-    def get_best_k_completions(self, prefix: str) -> list[AutoCompleteData]:
-        """Return up to five autocomplete results for ``prefix``."""
+    def get_best_k_completions(
+        self,
+        prefix: str,
+        k: int = 5,
+    ) -> list[AutoCompleteData]:
+        """Return up to ``k`` autocomplete results for ``prefix``."""
 
-        return [completion for _, completion in self.get_ranked_completions(prefix)]
+        return [
+            completion
+            for _, completion in self.get_ranked_completions(prefix, k=k)
+        ]
+
+    def get_next_word(self, prefix: str) -> str | None:
+        """Return the normalized continuation at the first matching context."""
+
+        normalized_prefix = normalize_text(prefix)
+        if not normalized_prefix:
+            return None
+
+        completions = self.get_best_k_completions(
+            prefix,
+            k=MAX_NODE_CACHE_SIZE,
+        )
+        for completion in completions:
+            normalized_sentence = normalize_text(completion.completed_sentence)
+            match_start = normalized_sentence.find(normalized_prefix)
+            if match_start < 0:
+                continue
+
+            cursor = match_start + len(normalized_prefix)
+            if prefix[-1:].isspace():
+                # A trailing space explicitly ends the current word.  Do not
+                # mistake the remainder of a longer word (for example,
+                # ``debe `` matching ``debecho``) for a next-word prediction.
+                if (
+                    cursor >= len(normalized_sentence)
+                    or normalized_sentence[cursor] != " "
+                ):
+                    continue
+                while cursor < len(normalized_sentence) and normalized_sentence[cursor] == " ":
+                    cursor += 1
+                word_end = normalized_sentence.find(" ", cursor)
+                if word_end < 0:
+                    word_end = len(normalized_sentence)
+                next_word = normalized_sentence[cursor:word_end]
+                if next_word:
+                    return next_word
+                continue
+
+            word_end = normalized_sentence.find(" ", cursor)
+            if word_end < 0:
+                word_end = len(normalized_sentence)
+            continuation = normalized_sentence[cursor:word_end]
+            if continuation:
+                return continuation
+
+        return None
 
     def record_selection(self, sentence_id: int) -> None:
         """Increment one selected sentence's usage count."""

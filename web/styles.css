@@ -177,14 +177,41 @@ input {
   transform: rotate(45deg);
 }
 
-#search-input {
+.search-input-stack {
   min-width: 0;
   flex: 1;
+  position: relative;
+}
+
+#search-input,
+#search-ghost {
+  width: 100%;
+  min-width: 0;
+  margin: 0;
+  padding: 0;
   border: 0;
   outline: 0;
+  font: inherit;
+  font-size: 16px;
+  line-height: normal;
+}
+
+#search-input {
+  position: relative;
+  z-index: 2;
   color: var(--ink);
   background: transparent;
-  font-size: 16px;
+}
+
+#search-ghost {
+  position: absolute;
+  z-index: 1;
+  inset: 0;
+  color: #9aa0a6;
+  background: var(--surface);
+  opacity: 1;
+  pointer-events: none;
+  -webkit-text-fill-color: #9aa0a6;
 }
 
 #search-input::-webkit-search-cancel-button {

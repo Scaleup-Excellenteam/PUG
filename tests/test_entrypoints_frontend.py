@@ -427,6 +427,7 @@ class FrontendContractTests(unittest.TestCase):
         server_source = (PROJECT_ROOT / "web_app.py").read_text(encoding="utf-8")
         required_routes = {
             "/api/suggestions",
+            "/api/next_word",
             "/api/select",
             "/api/events",
             "/api/admin/dashboard",
@@ -442,6 +443,22 @@ class FrontendContractTests(unittest.TestCase):
             with self.subTest(route=route):
                 self.assertIn(route, combined_frontend)
                 self.assertIn(route, server_source)
+
+    def test_ghost_text_is_layered_and_tab_acceptance_is_separate_from_dropdown(self) -> None:
+        html = (PROJECT_ROOT / "web" / "index.html").read_text(encoding="utf-8")
+        css = (PROJECT_ROOT / "web" / "styles.css").read_text(encoding="utf-8")
+        javascript = (PROJECT_ROOT / "web" / "app.js").read_text(encoding="utf-8")
+
+        ghost_position = html.index('id="search-ghost"')
+        input_position = html.index('id="search-input"')
+        self.assertLess(ghost_position, input_position)
+        self.assertIn('disabled tabindex="-1" aria-hidden="true"', html)
+        self.assertIn("#search-ghost", css)
+        self.assertIn("position: absolute;", css)
+        self.assertIn("background: transparent;", css)
+        self.assertIn('event.key === "Tab"', javascript)
+        self.assertIn('new Event("input", { bubbles: true })', javascript)
+        self.assertIn("ghostInput.value.startsWith(input.value)", javascript)
 
     @unittest.skipUnless(shutil.which("node"), "Node.js is unavailable for JS syntax checks")
     def test_javascript_files_pass_the_runtime_syntax_checker(self) -> None:

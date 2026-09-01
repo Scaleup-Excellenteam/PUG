@@ -147,6 +147,34 @@ class WebApplicationTests(unittest.TestCase):
         self.assertEqual(suggestion["offset"], 1)
         self.assertEqual(suggestion["score"], 10)
 
+    def test_next_word_endpoint_is_independent_and_returns_nullable_predictions(self) -> None:
+        self.assertEqual(
+            self.read_json("/api/next_word?query=thi"),
+            {"next_word": "s"},
+        )
+        self.assertEqual(
+            self.read_json("/api/next_word?query=this%20"),
+            {"next_word": "is"},
+        )
+        self.assertEqual(
+            self.read_json("/api/next_word?query=this"),
+            {"next_word": None},
+        )
+        self.assertEqual(
+            self.read_json("/api/next_word?query=demo%20"),
+            {"next_word": None},
+        )
+
+    def test_next_word_endpoint_reports_engine_failures(self) -> None:
+        with patch.object(
+            AutocompleteSystem,
+            "get_next_word",
+            side_effect=RuntimeError("prediction failed"),
+        ):
+            with self.assertRaises(HTTPError) as context:
+                urlopen(self.base_url + "/api/next_word?query=demo", timeout=2)
+        self.assertEqual(context.exception.code, HTTPStatus.INTERNAL_SERVER_ERROR)
+
     def test_click_equivalent_records_exact_selected_sentence(self) -> None:
         request = Request(
             self.base_url + "/api/select",
