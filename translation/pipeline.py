@@ -76,8 +76,8 @@ class InputAdaptationPipeline:
         self.guard.policy = self.sigma_policy
 
     def load_keymap_file(self, path: Path | str) -> None:
-        """Load a custom keyboard layout configuration from file."""
-        self.keymapper = KeyboardLayoutMapper.from_file(path)
+        """Load or merge an additional custom keyboard layout configuration from file."""
+        self.keymapper.add_layout_from_file(path)
 
     def process(self, query: str) -> QueryAdaptationResult:
         """Process a query through keyboard remapping, translation, and Sigma guard."""

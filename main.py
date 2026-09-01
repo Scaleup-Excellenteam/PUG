@@ -139,7 +139,7 @@ def run_cli(
                     print(
                         "Interactive commands:\n"
                         "  #          Select top suggestion and reset query\n"
-                        "  :keymap    Toggle Hebrew->QWERTY layout remapping (ON by default)\n"
+                        "  :keymap    Toggle layout remapping (ON by default)\n"
                         "  :translate Toggle token-level translation (OFF by default)\n"
                         "  :sigma     Cycle Sigma policy (warn -> block -> off)\n"
                         "  :status    Display active adaptation settings\n"

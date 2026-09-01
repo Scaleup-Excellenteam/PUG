@@ -26,6 +26,12 @@ class SigmaValidationResult:
     warning: str | None = None
 
 
+IGNORABLE_FORMATTING_CHARS = {
+    "\u200e", "\u200f", "\u202a", "\u202b", "\u202c", "\u202d", "\u202e",
+    "\u2066", "\u2067", "\u2068", "\u2069", "\ufeff", "\u200b",
+}
+
+
 class SigmaGuard:
     """Protects against queries containing symbols outside the system alphabet Sigma."""
 
@@ -39,7 +45,7 @@ class SigmaGuard:
 
     def find_violations(self, text: str) -> list[str]:
         """Return a sorted list of unique characters in text outside alphabet Sigma."""
-        return sorted({ch for ch in text if ch not in self.alphabet})
+        return sorted({ch for ch in text if ch not in self.alphabet and ch not in IGNORABLE_FORMATTING_CHARS})
 
     def validate(
         self,

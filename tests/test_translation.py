@@ -69,6 +69,19 @@ class KeyboardLayoutMapperTests(unittest.TestCase):
         finally:
             tmp_path.unlink(missing_ok=True)
 
+    def test_multiple_layouts_loaded_and_active_simultaneously(self) -> None:
+        # Default mapper auto-loads both Hebrew and Arabic layouts from layouts/
+        mapper = KeyboardLayoutMapper.load_default()
+        self.assertGreaterEqual(len(mapper.loaded_layouts), 2)
+        # Hebrew typing remaps to "hello"
+        self.assertEqual(mapper.remap_text("יקךךם"), "hello")
+        # Arabic typing remaps to "hello" simultaneously without mode switches!
+        self.assertEqual(mapper.remap_text("اثممخ"), "hello")
+        # Arabic typing remaps to "python"
+        self.assertEqual(mapper.remap_text("حغفاخى"), "python")
+        # Copy-pasted text with invisible RTL marks (\u200f, \u200e) remaps cleanly
+        self.assertEqual(mapper.remap_text("\u200fحغفاخى\u200e"), "python")
+
 
 class SigmaGuardTests(unittest.TestCase):
     """Test Sigma alphabet validation and policy enforcement."""
