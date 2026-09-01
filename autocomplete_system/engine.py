@@ -96,16 +96,26 @@ class AutocompleteSystem:
         cache_hit = search_query != normalized_query
 
         mode = self.ranking_mode if ranking_mode is None else ranking_mode
+
+        # Candidate retrieval must not change when popularity is toggled. Both
+        # modes search the mandatory length-ranked node cache; the active mode
+        # affects only the final usage-count bonus below. Passing ASSIGNMENT to
+        # the index would select its legacy alphabetical cache and could return
+        # an entirely different group of sentences for the same query.
+        candidate_cache_mode = RankingMode.POPULARITY
         if isinstance(self.index, SQLiteSubstringIndex) or type(self.index).__name__ == 'SuffixArrayIndex':
             text_scores = self.index.candidate_text_scores(
                 search_query,
-                mode,
+                candidate_cache_mode,
                 allow_popularity_exact_shortcut=(
-                    mode is RankingMode.POPULARITY and not self._has_usage_counts
+                    not self._has_usage_counts
                 ),
             )
         else:
-            text_scores = self.index.candidate_text_scores(search_query, mode)
+            text_scores = self.index.candidate_text_scores(
+                search_query,
+                candidate_cache_mode,
+            )
         ranked: list[tuple[int, int]] = []
         for sentence_id, text_score in text_scores.items():
             final_score = text_score

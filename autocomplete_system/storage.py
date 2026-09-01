@@ -13,9 +13,10 @@ from .constants import (
     INDEX_FILENAME,
     INDEX_VERSION,
     MASTER_ARRAY_FILENAME,
+    RANKING_SETTINGS_FILENAME,
     USAGE_STATS_FILENAME,
 )
-from .models import SentenceRecord
+from .models import RankingMode, SentenceRecord
 from .logging_config import log_event
 from .sqlite_index import SQLiteSubstringIndex
 from .trie import CompressedSuffixTrie
@@ -187,4 +188,57 @@ def save_usage_stats(
         "usage_stats_persisted",
         data_directory=str(data_directory),
         nonzero_entries=len(stats),
+    )
+
+
+def load_ranking_mode_setting(
+    data_directory: Path,
+    default: RankingMode,
+) -> RankingMode:
+    """Load the web ranking preference, or return ``default`` if none exists."""
+
+    settings_path = data_directory / RANKING_SETTINGS_FILENAME
+    if not settings_path.exists():
+        log_event(
+            LOGGER,
+            "ranking_mode_setting_defaulted",
+            data_directory=str(data_directory),
+            ranking_mode=default.value,
+        )
+        return default
+    raw_settings: Any = json.loads(settings_path.read_text(encoding="utf-8"))
+    if not isinstance(raw_settings, dict):
+        raise ValueError("ranking_settings.json must contain a JSON object.")
+    raw_mode = raw_settings.get("ranking_mode")
+    try:
+        ranking_mode = RankingMode(raw_mode)
+    except (TypeError, ValueError) as error:
+        raise ValueError("ranking_settings.json contains an invalid ranking_mode.") from error
+    log_event(
+        LOGGER,
+        "ranking_mode_setting_loaded",
+        data_directory=str(data_directory),
+        ranking_mode=ranking_mode.value,
+    )
+    return ranking_mode
+
+
+def save_ranking_mode_setting(
+    data_directory: Path,
+    ranking_mode: RankingMode,
+) -> None:
+    """Atomically persist the web ranking preference."""
+
+    data_directory.mkdir(parents=True, exist_ok=True)
+    serialized = json.dumps(
+        {"ranking_mode": ranking_mode.value},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    _atomic_write_text(data_directory / RANKING_SETTINGS_FILENAME, serialized)
+    log_event(
+        LOGGER,
+        "ranking_mode_setting_persisted",
+        data_directory=str(data_directory),
+        ranking_mode=ranking_mode.value,
     )

@@ -29,6 +29,8 @@ from .logging_config import (
     DEFAULT_MAX_LOG_BYTES,
     SYSTEM_LOG_FILENAME,
 )
+from .models import RankingMode
+from .storage import save_ranking_mode_setting
 
 
 def utc_now() -> str:
@@ -508,6 +510,7 @@ class AdminService:
             "configuration": {
                 "index_backend": type(self.system.index).__name__,
                 "ranking_mode": self.system.ranking_mode.value,
+                "popularity_enabled": self.system.ranking_mode is RankingMode.POPULARITY,
                 "alpha": ALPHA,
                 "max_node_cache_size": MAX_NODE_CACHE_SIZE,
                 "data_directory": str(self.system.data_directory)
@@ -650,6 +653,17 @@ class AdminService:
             self._usage_total = 0
         if self.system.data_directory is not None:
             self.system.save_usage_stats()
+
+    def set_popularity_enabled(self, enabled: bool) -> RankingMode:
+        """Enable or disable popularity weighting without deleting usage counts."""
+
+        ranking_mode = (
+            RankingMode.POPULARITY if enabled else RankingMode.ASSIGNMENT
+        )
+        self.system.ranking_mode = ranking_mode
+        if self.system.data_directory is not None:
+            save_ranking_mode_setting(self.system.data_directory, ranking_mode)
+        return ranking_mode
 
     def start_rebuild(self) -> dict[str, object]:
         return self.rebuild_manager.start()

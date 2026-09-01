@@ -67,8 +67,9 @@ function renderMetrics(data) {
   byId("metric-unique").textContent = `${number(searches.unique_normalized_queries)} unique queries`;
   byId("metric-success").textContent = `${Number(searches.success_rate_percent).toFixed(1)}%`;
   byId("metric-no-results").textContent = `${number(searches.no_results)} without results`;
-  byId("metric-selections").textContent = number(analytics.selections);
-  byId("metric-popularity").textContent = `${number(popularity.total_usage)} popularity events`;
+  byId("metric-selections").textContent = number(popularity.total_usage);
+  const popularityState = data.configuration.popularity_enabled ? "enabled" : "disabled";
+  byId("metric-popularity").textContent = `Weighting ${popularityState} · ${number(analytics.selections)} logged selections`;
   byId("metric-p95").textContent = duration(analytics.performance_ms.p95);
   byId("metric-average").textContent = `${duration(analytics.performance_ms.average)} average`;
   byId("metric-voice").textContent = number(searches.voice);
@@ -116,12 +117,28 @@ function renderTopQueries(items) {
   }), 5);
 }
 
-function renderTopSelections(items) {
+function renderPopularity(items, alpha, enabled) {
   replaceTable("top-selections", items.slice(0, 20).map((item) => {
+    const effectiveBonus = enabled ? item.usage_count * alpha : 0;
     const row = document.createElement("tr"); row.append(
-      textCell(item.completed_sentence, "cell-sentence"), textCell(`${item.source_text}:${item.offset}`, "cell-muted"), textCell(number(item.count)),
+      textCell(item.completed_sentence, "cell-sentence"), textCell(`${item.source_text}:${item.offset}`, "cell-muted"),
+      textCell(number(item.usage_count)), textCell(enabled ? `+${number(effectiveBonus)}` : "+0 (disabled)"),
     ); return row;
-  }), 3);
+  }), 4);
+}
+
+function renderPopularityControl(enabled) {
+  const control = byId("popularity-control");
+  const button = byId("toggle-popularity");
+  control.dataset.enabled = String(enabled);
+  button.dataset.enabled = String(enabled);
+  button.setAttribute("aria-checked", String(enabled));
+  button.textContent = enabled ? "Turn popularity off" : "Turn popularity on";
+  button.className = `button ${enabled ? "button--quiet" : "button--success"}`;
+  button.disabled = false;
+  byId("popularity-control-description").textContent = enabled
+    ? "Enabled: usage_count contributes 5 points per selection to every result score."
+    : "Disabled: results use text scores only. Stored usage counts are retained.";
 }
 
 function renderSources(items) {
@@ -258,7 +275,8 @@ async function loadDashboard(showStatus = false) {
     if (!response.ok) throw new Error("Dashboard data could not be loaded");
     const data = await response.json(); state.dashboard = data;
     renderMetrics(data); renderActivity(data.analytics.searches_by_hour); renderSystem(data);
-    renderTopQueries(data.analytics.top_queries); renderTopSelections(data.analytics.top_selections);
+    renderPopularityControl(data.configuration.popularity_enabled);
+    renderTopQueries(data.analytics.top_queries); renderPopularity(data.corpus.popularity.top_sentences, data.configuration.alpha, data.configuration.popularity_enabled);
     renderSources(data.corpus.sources); renderStorage(data.storage);
     renderRecentEvents(data.analytics.recent_events, data.analytics.event_count); renderRebuild(data.rebuild);
     byId("last-updated").textContent = date(data.generated_at);
@@ -292,11 +310,34 @@ async function executeAction(event) {
   finally { byId("dialog-confirm").disabled = false; }
 }
 
+async function togglePopularity() {
+  const button = byId("toggle-popularity");
+  const enabled = button.dataset.enabled === "true";
+  button.disabled = true;
+  button.textContent = "Saving…";
+  try {
+    const response = await fetch("/api/admin/settings/popularity", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ enabled: !enabled }),
+    });
+    const payload = await response.json();
+    if (!response.ok) throw new Error(payload.error || "The ranking setting could not be changed");
+    showToast(payload.message);
+    await loadDashboard(true);
+  } catch (error) {
+    showToast(error.message);
+    button.disabled = false;
+    button.textContent = enabled ? "Turn popularity off" : "Turn popularity on";
+  }
+}
+
 byId("refresh-button").addEventListener("click", () => Promise.all([loadDashboard(true), loadSentences()]));
 byId("sentences-previous").addEventListener("click", () => { state.sentenceOffset = Math.max(0, state.sentenceOffset - state.sentenceLimit); loadSentences(); });
 byId("sentences-next").addEventListener("click", () => { state.sentenceOffset += state.sentenceLimit; loadSentences(); });
 document.querySelectorAll(".admin-action").forEach((button) => button.addEventListener("click", () => openConfirmation(button.dataset.action)));
 byId("dialog-confirm").addEventListener("click", executeAction);
+byId("toggle-popularity").addEventListener("click", togglePopularity);
 byId("confirmation-dialog").addEventListener("close", () => { state.action = null; });
 byId("log-refresh").addEventListener("click", () => Promise.all([loadLogFiles(), loadSystemLogs()]));
 byId("log-file").addEventListener("change", loadSystemLogs);
