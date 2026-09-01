@@ -20,8 +20,9 @@ from .models import RankingMode, SentenceRecord
 from .logging_config import log_event
 from .sqlite_index import SQLiteSubstringIndex
 from .trie import CompressedSuffixTrie
+from .suffix_array import SuffixArrayIndex
 
-SearchIndex: TypeAlias = CompressedSuffixTrie | SQLiteSubstringIndex
+SearchIndex: TypeAlias = CompressedSuffixTrie | SQLiteSubstringIndex | SuffixArrayIndex
 LOGGER = logging.getLogger("autocomplete.storage")
 
 
@@ -97,7 +98,7 @@ def load_index(data_directory: Path) -> tuple[SearchIndex, list[SentenceRecord]]
         not isinstance(envelope, dict)
         or envelope.get("version") != INDEX_VERSION
         or not isinstance(
-            envelope.get("index"), (CompressedSuffixTrie, SQLiteSubstringIndex)
+            envelope.get("index"), (CompressedSuffixTrie, SQLiteSubstringIndex, SuffixArrayIndex)
         )
     ):
         raise ValueError(

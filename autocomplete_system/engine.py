@@ -12,6 +12,7 @@ from .logging_config import log_event
 from .normalization import normalize_text
 from .sqlite_index import SQLiteSubstringIndex
 from .storage import SearchIndex, load_index, save_usage_stats
+from autocomplete_system.error_cache import ErrorCache
 
 
 LOGGER = logging.getLogger("autocomplete.engine")
@@ -32,6 +33,25 @@ class AutocompleteSystem:
         self.data_directory = data_directory
         self.ranking_mode = ranking_mode
         self._has_usage_counts = any(record.usage_count for record in master_array)
+        self.error_cache = ErrorCache()
+        self._search_count = 0
+        # Call on activation for demonstration
+        self._run_error_cache_worker(trigger="activation")
+
+    def _run_error_cache_worker(self, trigger: str) -> None:
+        """Execute an error cache background cycle with operational logging."""
+        started = time.perf_counter()
+        queued_items = len(self.error_cache.queue)
+        self.error_cache.rebuild_cycle()
+        log_event(
+            LOGGER,
+            "error_cache_worker_executed",
+            trigger=trigger,
+            search_count=self._search_count,
+            queued_items=queued_items,
+            cache_size=len(self.error_cache.cache),
+            duration_ms=round((time.perf_counter() - started) * 1000, 3),
+        )
 
     @property
     def trie(self) -> SearchIndex:
@@ -89,6 +109,10 @@ class AutocompleteSystem:
             )
             return []
 
+        # Phase 1: Fast O(L) scan and replace via Aho-Corasick DFA
+        search_query = self.error_cache.scan_and_replace(normalized_query)
+        cache_hit = search_query != normalized_query
+
         mode = self.ranking_mode if ranking_mode is None else ranking_mode
 
         # Candidate retrieval must not change when popularity is toggled. Both
@@ -97,9 +121,9 @@ class AutocompleteSystem:
         # the index would select its legacy alphabetical cache and could return
         # an entirely different group of sentences for the same query.
         candidate_cache_mode = RankingMode.POPULARITY
-        if isinstance(self.index, SQLiteSubstringIndex):
+        if isinstance(self.index, SQLiteSubstringIndex) or type(self.index).__name__ == 'SuffixArrayIndex':
             text_scores = self.index.candidate_text_scores(
-                normalized_query,
+                search_query,
                 candidate_cache_mode,
                 allow_popularity_exact_shortcut=(
                     not self._has_usage_counts
@@ -107,7 +131,7 @@ class AutocompleteSystem:
             )
         else:
             text_scores = self.index.candidate_text_scores(
-                normalized_query,
+                search_query,
                 candidate_cache_mode,
             )
         ranked: list[tuple[int, int]] = []
@@ -164,6 +188,37 @@ class AutocompleteSystem:
             ],
             duration_ms=round((time.perf_counter() - started) * 1000, 3),
         )
+
+        # Phase 2: Organic Learning (Asynchronous Write Path)
+        # If we didn't use the cache, but found a typo correction organically, submit it!
+        if not cache_hit and results:
+            best_id, best_data = results[0]
+            # A score < 2*len means we used a 1-edit penalty to find it
+            if best_data.score < 2 * len(normalized_query):
+                record_norm = self.master_array[best_id].normalized_text
+                # Find which 1-edit variant successfully matched
+                from autocomplete_system.scoring import generate_scored_variants
+
+                # Use a basic english alphabet for recovery
+                alphabet = "abcdefghijklmnopqrstuvwxyz0123456789 "
+                variants = generate_scored_variants(normalized_query, alphabet)
+
+                best_variant = None
+                best_variant_score = -1
+                for var, sc in variants.items():
+                    if sc > best_variant_score and var in record_norm:
+                        best_variant = var
+                        best_variant_score = sc
+
+                if best_variant:
+                    self.error_cache.submit_correction(normalized_query, best_variant)
+
+        # TODO - implement: periodic timed cycle will be determined later;
+        # using a 10-call cycle for demonstration.
+        self._search_count += 1
+        if self._search_count % 10 == 0:
+            self._run_error_cache_worker(trigger="10_call_cycle")
+
         return results
 
     def get_best_k_completions(self, prefix: str) -> list[AutoCompleteData]:

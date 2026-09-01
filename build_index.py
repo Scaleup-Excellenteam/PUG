@@ -39,11 +39,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--backend",
-        choices=("sqlite", "trie"),
+        choices=("sqlite", "trie", "array"),
         default="sqlite",
         help=(
             "sqlite is scalable for the supplied archive; trie builds the literal "
-            "all-character compressed suffix Trie for smaller corpora."
+            "all-character compressed suffix Trie for smaller corpora; array builds the Suffix Array."
         ),
     )
     return parser.parse_args()
@@ -77,6 +77,10 @@ def main() -> None:
             args.data_dir,
             progress_callback=report_progress,
         )
+    elif args.backend == "array":
+        print("Building the suffix array...", flush=True)
+        from autocomplete_system.indexer import build_array_index
+        index, master_array = build_array_index(sources)
     else:
         print("Building the literal compressed suffix Trie...", flush=True)
         index, master_array = build_index(sources)

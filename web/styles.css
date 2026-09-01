@@ -381,6 +381,42 @@ input {
   white-space: nowrap;
 }
 
+.adaptation-notice {
+  width: min(100%, 590px);
+  margin: 10px auto 0;
+  padding: 8px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  border-radius: 8px;
+  font-size: 13px;
+  text-align: left;
+}
+
+.adaptation-notice__remap {
+  color: #202124;
+  line-height: 1.4;
+}
+
+.adaptation-notice__remap strong {
+  color: var(--blue, #1a73e8);
+}
+
+.adaptation-notice__original {
+  color: #70757a;
+  font-size: 12px;
+}
+
+.adaptation-notice__warning {
+  padding: 6px 10px;
+  border-radius: 6px;
+  background-color: #fef7e0;
+  border: 1px solid #f9ab00;
+  color: #795548;
+  font-size: 12px;
+  line-height: 1.35;
+}
+
 .search-status {
   min-height: 20px;
   margin: 12px 0 0;

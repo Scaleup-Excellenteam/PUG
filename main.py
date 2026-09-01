@@ -10,6 +10,11 @@ from autocomplete_system.constants import DEFAULT_DATA_DIRECTORY
 from autocomplete_system.engine import AutocompleteSystem
 from autocomplete_system.logging_config import configure_system_logging, log_event
 from autocomplete_system.models import RankingMode
+from translation import (
+    AdaptationMode,
+    InputAdaptationPipeline,
+    SigmaPolicy,
+)
 
 
 READY_PROMPT = "The system is ready. Enter your text:"
@@ -35,11 +40,54 @@ def parse_args() -> argparse.Namespace:
             "popularity adds Alpha * usage_count."
         ),
     )
+    parser.add_argument(
+        "--no-keymap",
+        action="store_false",
+        dest="keymap",
+        default=True,
+        help="Disable automatic keyboard layout remapping (enabled by default).",
+    )
+    parser.add_argument(
+        "--translate",
+        action="store_true",
+        default=False,
+        help="Enable token-level Google translation (disabled by default).",
+    )
+    parser.add_argument(
+        "--adaptation-mode",
+        type=str,
+        choices=[m.value for m in AdaptationMode],
+        default=None,
+        help="Legacy input adaptation mode: off, translate, or keymap.",
+    )
+    parser.add_argument(
+        "--sigma-policy",
+        type=str,
+        choices=[p.value for p in SigmaPolicy],
+        default=SigmaPolicy.WARN.value,
+        help="Alphabet Sigma policy: off, warn, or block (default: warn).",
+    )
+    parser.add_argument(
+        "--keymap-file",
+        type=Path,
+        default=None,
+        help="Path to custom JSON keyboard layout mapping file.",
+    )
     return parser.parse_args()
 
 
-def run_cli(system: AutocompleteSystem) -> None:
+def run_cli(
+    system: AutocompleteSystem,
+    pipeline: InputAdaptationPipeline | None = None,
+) -> None:
     """Read prefixes until interrupted, recording top choices on '#'."""
+
+    if pipeline is None:
+        pipeline = InputAdaptationPipeline(
+            enable_keymap=True,
+            enable_translate=False,
+            sigma_policy=SigmaPolicy.WARN,
+        )
 
     current_input = ""
     previous_top_sentence_id: int | None = None
@@ -48,6 +96,9 @@ def run_cli(system: AutocompleteSystem) -> None:
         "cli_started",
         ranking_mode=system.ranking_mode.value,
         backend=type(system.index).__name__,
+        keymap_enabled=pipeline.enable_keymap,
+        translate_enabled=pipeline.enable_translate,
+        sigma_policy=pipeline.sigma_policy.value,
     )
     print(READY_PROMPT)
     try:
@@ -56,6 +107,47 @@ def run_cli(system: AutocompleteSystem) -> None:
                 user_input = input()
             except EOFError:
                 break
+
+            # Handle interactive command prefixes
+            if user_input.startswith(":"):
+                cmd = user_input.strip().lower()
+                if cmd == ":translate":
+                    enabled = pipeline.toggle_translate()
+                    state = "ENABLED" if enabled else "DISABLED"
+                    print(f"[Config] Token-level translation: {state}")
+                elif cmd == ":keymap":
+                    enabled = pipeline.toggle_keymap()
+                    state = "ENABLED" if enabled else "DISABLED"
+                    print(f"[Config] Keyboard remapping: {state}")
+                elif cmd == ":sigma":
+                    next_policy = {
+                        SigmaPolicy.WARN: SigmaPolicy.BLOCK,
+                        SigmaPolicy.BLOCK: SigmaPolicy.OFF,
+                        SigmaPolicy.OFF: SigmaPolicy.WARN,
+                    }[pipeline.sigma_policy]
+                    pipeline.set_sigma_policy(next_policy)
+                    print(f"[Config] Sigma policy set to: {next_policy.value}")
+                elif cmd == ":status":
+                    km_str = "ON" if pipeline.enable_keymap else "OFF"
+                    tr_str = "ON" if pipeline.enable_translate else "OFF"
+                    print(
+                        f"[Status] Keyboard remap: {km_str} | "
+                        f"Translation: {tr_str} | "
+                        f"Sigma policy: {pipeline.sigma_policy.value}"
+                    )
+                elif cmd in (":help", ":?"):
+                    print(
+                        "Interactive commands:\n"
+                        "  #          Select top suggestion and reset query\n"
+                        "  :keymap    Toggle Hebrew->QWERTY layout remapping (ON by default)\n"
+                        "  :translate Toggle token-level translation (OFF by default)\n"
+                        "  :sigma     Cycle Sigma policy (warn -> block -> off)\n"
+                        "  :status    Display active adaptation settings\n"
+                        "  :help      Show this help message"
+                    )
+                else:
+                    print(f"Unknown command: {user_input}. Type :help for commands.")
+                continue
 
             if user_input == "#":
                 selected_sentence_id = previous_top_sentence_id
@@ -72,13 +164,46 @@ def run_cli(system: AutocompleteSystem) -> None:
                 continue
 
             current_input += user_input
+
+            # Run query through adaptation pipeline (translation / keymap / sigma guard)
+            adaptation = pipeline.process(current_input)
+
+            if adaptation.is_blocked:
+                print(f"[Blocked] {adaptation.warning_message}")
+                print("Query was blocked by Sigma policy.")
+                continue
+
+            if adaptation.warning_message:
+                print(f"[Warning] {adaptation.warning_message}")
+                try:
+                    proceed = input("Proceed anyway? (y/n): ").strip().lower()
+                except EOFError:
+                    break
+                if proceed not in ("y", "yes"):
+                    current_input = ""
+                    previous_top_sentence_id = None
+                    print(READY_PROMPT)
+                    continue
+
+            if adaptation.was_adapted:
+                langs = (
+                    f" (detected: {', '.join(adaptation.detected_languages)})"
+                    if adaptation.detected_languages
+                    else ""
+                )
+                print(
+                    f"[Adapted]: '{adaptation.original_query}' -> '{adaptation.final_query}'{langs}"
+                )
+
+            effective_query = adaptation.final_query
             log_event(
                 LOGGER,
                 "cli_input_received",
                 input_fragment=user_input,
                 current_query=current_input,
+                effective_query=effective_query,
             )
-            ranked = system.get_ranked_completions(current_input)
+            ranked = system.get_ranked_completions(effective_query)
             previous_top_sentence_id = ranked[0][0] if ranked else None
             if not ranked:
                 continue
@@ -102,7 +227,39 @@ def run_cli(system: AutocompleteSystem) -> None:
 def main() -> None:
     configure_system_logging()
     args = parse_args()
-    run_cli(AutocompleteSystem.load(args.data_dir, args.mode))
+    system = AutocompleteSystem.load(args.data_dir, args.mode)
+
+    keymap_enabled = getattr(args, "keymap", True)
+    translate_enabled = getattr(args, "translate", False)
+    adaptation_mode = getattr(args, "adaptation_mode", None)
+    if adaptation_mode is not None:
+        if adaptation_mode == AdaptationMode.OFF.value:
+            keymap_enabled = False
+            translate_enabled = False
+        elif adaptation_mode == AdaptationMode.KEYBOARD_REMAP.value:
+            keymap_enabled = True
+        elif adaptation_mode == AdaptationMode.TRANSLATE.value:
+            translate_enabled = True
+
+    sigma_policy = getattr(args, "sigma_policy", SigmaPolicy.WARN.value)
+    keymap_file = getattr(args, "keymap_file", None)
+
+    if (
+        not keymap_enabled
+        or translate_enabled
+        or (sigma_policy and sigma_policy != SigmaPolicy.WARN.value)
+        or keymap_file
+    ):
+        pipeline = InputAdaptationPipeline(
+            enable_keymap=keymap_enabled,
+            enable_translate=translate_enabled,
+            sigma_policy=SigmaPolicy(sigma_policy or SigmaPolicy.WARN.value),
+        )
+        if keymap_file:
+            pipeline.load_keymap_file(keymap_file)
+        run_cli(system, pipeline)
+    else:
+        run_cli(system)
 
 
 if __name__ == "__main__":

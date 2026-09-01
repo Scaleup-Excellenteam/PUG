@@ -7,6 +7,7 @@ const loadingIndicator = document.querySelector("#loading-indicator");
 const searchShell = document.querySelector("#search-shell");
 const suggestionList = document.querySelector("#suggestions");
 const searchStatus = document.querySelector("#search-status");
+const adaptationNotice = document.querySelector("#adaptation-notice");
 const selectionCard = document.querySelector("#selection-card");
 const selectedSentence = document.querySelector("#selected-sentence");
 const selectedSource = document.querySelector("#selected-source");
@@ -103,6 +104,38 @@ function renderSuggestions(items) {
     : "No matching sentences found";
 }
 
+function escapeHtml(str) {
+  const div = document.createElement("div");
+  div.textContent = str;
+  return div.innerHTML;
+}
+
+function updateAdaptationNotice(payload) {
+  if (!adaptationNotice) return;
+  if (!payload || (!payload.was_adapted && !payload.warning)) {
+    adaptationNotice.hidden = true;
+    adaptationNotice.replaceChildren();
+    return;
+  }
+
+  adaptationNotice.replaceChildren();
+  adaptationNotice.hidden = false;
+
+  if (payload.warning) {
+    const warningEl = document.createElement("div");
+    warningEl.className = "adaptation-notice__warning";
+    warningEl.textContent = `⚠️ ${payload.warning}`;
+    adaptationNotice.appendChild(warningEl);
+  }
+
+  if (payload.was_adapted) {
+    const remapEl = document.createElement("div");
+    remapEl.className = "adaptation-notice__remap";
+    remapEl.innerHTML = `Showing results for <strong>${escapeHtml(payload.adapted_query)}</strong> <span class="adaptation-notice__original">(remapped from "${escapeHtml(payload.original_query)}")</span>`;
+    adaptationNotice.appendChild(remapEl);
+  }
+}
+
 async function fetchSuggestions(query, inputMethod = "typed") {
   if (currentRequest) {
     currentRequest.abort();
@@ -122,6 +155,7 @@ async function fetchSuggestions(query, inputMethod = "typed") {
     if (input.value === query) {
       lastInputMethod = inputMethod;
       renderSuggestions(payload.suggestions);
+      updateAdaptationNotice(payload);
     }
   } catch (error) {
     if (error.name !== "AbortError") {
@@ -129,6 +163,10 @@ async function fetchSuggestions(query, inputMethod = "typed") {
       suggestionList.replaceChildren();
       setOpen(false);
       searchStatus.textContent = "Search is temporarily unavailable";
+      if (adaptationNotice) {
+        adaptationNotice.hidden = true;
+        adaptationNotice.replaceChildren();
+      }
     }
   } finally {
     if (input.value === query) {
@@ -152,6 +190,10 @@ function scheduleSearch() {
     suggestions = [];
     suggestionList.replaceChildren();
     searchStatus.textContent = "";
+    if (adaptationNotice) {
+      adaptationNotice.hidden = true;
+      adaptationNotice.replaceChildren();
+    }
     setOpen(false);
     return;
   }

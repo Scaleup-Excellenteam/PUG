@@ -10,6 +10,7 @@ from .models import RankingMode
 from .scoring import indel_penalty, substitution_penalty
 
 CandidateSortKey = Callable[[int], tuple[object, ...]]
+CACHE_DEPTH_LIMIT = 20
 
 
 class RadixEdge:
@@ -23,12 +24,13 @@ class RadixEdge:
 class TrieNode:
     """Compact explicit node containing only ID caches and child edges."""
 
-    __slots__ = ("children", "candidate_ids", "assignment_candidate_ids")
+    __slots__ = ("children", "candidate_ids", "assignment_candidate_ids", "exact_match_ids")
 
     def __init__(self) -> None:
         self.children: dict[str, RadixEdge] = {}
         self.candidate_ids: list[int] = []
         self.assignment_candidate_ids: list[int] = []
+        self.exact_match_ids: set[int] = set()
 
 
 class CompressedSuffixTrie:
@@ -61,7 +63,10 @@ class CompressedSuffixTrie:
         sentence_id: int,
         length_key: CandidateSortKey,
         alphabetical_key: CandidateSortKey,
+        depth: int,
     ) -> None:
+        if depth > CACHE_DEPTH_LIMIT:
+            return
         cls._cache_candidate(node.candidate_ids, sentence_id, length_key)
         cls._cache_candidate(
             node.assignment_candidate_ids, sentence_id, alphabetical_key
@@ -78,13 +83,16 @@ class CompressedSuffixTrie:
             return
         node = self.root
         remaining = suffix
-        self._cache_both(node, sentence_id, length_key, alphabetical_key)
+        current_depth = 0
+        self._cache_both(node, sentence_id, length_key, alphabetical_key, current_depth)
 
         while remaining:
             edge = node.children.get(remaining[0])
             if edge is None:
                 child = TrieNode()
-                self._cache_both(child, sentence_id, length_key, alphabetical_key)
+                current_depth += len(remaining)
+                self._cache_both(child, sentence_id, length_key, alphabetical_key, current_depth)
+                child.exact_match_ids.add(sentence_id)
                 node.children[remaining[0]] = RadixEdge(remaining, child)
                 return
 
@@ -99,7 +107,10 @@ class CompressedSuffixTrie:
             if common_length == len(edge.label):
                 remaining = remaining[common_length:]
                 node = edge.child
-                self._cache_both(node, sentence_id, length_key, alphabetical_key)
+                current_depth += common_length
+                self._cache_both(node, sentence_id, length_key, alphabetical_key, current_depth)
+                if not remaining:
+                    node.exact_match_ids.add(sentence_id)
                 continue
 
             split_node = TrieNode()
@@ -107,8 +118,9 @@ class CompressedSuffixTrie:
             split_node.assignment_candidate_ids = (
                 edge.child.assignment_candidate_ids.copy()
             )
+            current_depth += common_length
             self._cache_both(
-                split_node, sentence_id, length_key, alphabetical_key
+                split_node, sentence_id, length_key, alphabetical_key, current_depth
             )
 
             old_remainder = edge.label[common_length:]
@@ -123,11 +135,14 @@ class CompressedSuffixTrie:
             if new_remainder:
                 new_child = TrieNode()
                 self._cache_both(
-                    new_child, sentence_id, length_key, alphabetical_key
+                    new_child, sentence_id, length_key, alphabetical_key, current_depth + len(new_remainder)
                 )
+                new_child.exact_match_ids.add(sentence_id)
                 split_node.children[new_remainder[0]] = RadixEdge(
                     new_remainder, new_child
                 )
+            else:
+                split_node.exact_match_ids.add(sentence_id)
             return
 
     def insert_sentence(
@@ -172,6 +187,17 @@ class CompressedSuffixTrie:
         assert node is not None
         return node
 
+    @staticmethod
+    def _collect_dfs(node: TrieNode) -> set[int]:
+        stack = [node]
+        results = set()
+        while stack:
+            curr = stack.pop()
+            results.update(curr.exact_match_ids)
+            for edge in curr.children.values():
+                stack.append(edge.child)
+        return results
+
     def candidate_text_scores(
         self, query: str, ranking_mode: RankingMode
     ) -> dict[int, int]:
@@ -204,6 +230,9 @@ class CompressedSuffixTrie:
                     if ranking_mode is RankingMode.ASSIGNMENT
                     else cursor_node.candidate_ids
                 )
+                if not candidates:
+                    candidates = self._collect_dfs(cursor_node)
+
                 for sentence_id in candidates:
                     previous = best_candidates.get(sentence_id)
                     if previous is None or score > previous:
