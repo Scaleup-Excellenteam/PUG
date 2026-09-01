@@ -53,6 +53,41 @@ class AutocompleteSystem:
             duration_ms=round((time.perf_counter() - started) * 1000, 3),
         )
 
+    def adopt_snapshot(
+        self,
+        index: SearchIndex,
+        master_array: list[SentenceRecord],
+        data_directory: Path,
+    ) -> None:
+        """Atomically replace the served index and corpus in place.
+
+        This ``AutocompleteSystem`` object's identity never changes, so every
+        reference already held by request handlers, the admin service, and
+        the background snapshot watcher keeps pointing at the same live
+        object; only its internal state is swapped. As with the ``ErrorCache``
+        DFA swap, attribute reassignment is a single GIL-protected step, so a
+        request already in flight on another thread keeps seeing either the
+        complete previous snapshot or the complete new one, never a mix, and
+        is never interrupted by this call.
+        """
+
+        previous_index = self.index
+        self.index = index
+        self.master_array = master_array
+        self.data_directory = data_directory
+        self._has_usage_counts = any(record.usage_count for record in master_array)
+        self.error_cache = ErrorCache()
+        self._search_count = 0
+        if isinstance(previous_index, SQLiteSubstringIndex):
+            previous_index.close()
+        log_event(
+            LOGGER,
+            "snapshot_adopted",
+            data_directory=str(data_directory),
+            backend=type(index).__name__,
+            sentence_count=len(master_array),
+        )
+
     @property
     def trie(self) -> SearchIndex:
         """Backward-compatible name for callers that used the original API."""
@@ -109,6 +144,15 @@ class AutocompleteSystem:
             )
             return []
 
+        # Capture the index and master array once, up front. A background
+        # ZDT snapshot activation (AutocompleteSystem.adopt_snapshot) can
+        # reassign self.index/self.master_array on another thread at any
+        # time; using these local names for the rest of this call keeps one
+        # request internally consistent with whichever complete snapshot was
+        # live when it started, exactly like the ErrorCache atomic-swap idiom.
+        index = self.index
+        master_array = self.master_array
+
         # Phase 1: Fast O(L) scan and replace via Aho-Corasick DFA
         search_query = self.error_cache.scan_and_replace(normalized_query)
         cache_hit = search_query != normalized_query
@@ -121,8 +165,8 @@ class AutocompleteSystem:
         # the index would select its legacy alphabetical cache and could return
         # an entirely different group of sentences for the same query.
         candidate_cache_mode = RankingMode.POPULARITY
-        if isinstance(self.index, SQLiteSubstringIndex) or type(self.index).__name__ == 'SuffixArrayIndex':
-            text_scores = self.index.candidate_text_scores(
+        if isinstance(index, SQLiteSubstringIndex) or type(index).__name__ == 'SuffixArrayIndex':
+            text_scores = index.candidate_text_scores(
                 search_query,
                 candidate_cache_mode,
                 allow_popularity_exact_shortcut=(
@@ -130,7 +174,7 @@ class AutocompleteSystem:
                 ),
             )
         else:
-            text_scores = self.index.candidate_text_scores(
+            text_scores = index.candidate_text_scores(
                 search_query,
                 candidate_cache_mode,
             )
@@ -138,23 +182,23 @@ class AutocompleteSystem:
         for sentence_id, text_score in text_scores.items():
             final_score = text_score
             if mode is RankingMode.POPULARITY:
-                final_score += ALPHA * self.master_array[sentence_id].usage_count
+                final_score += ALPHA * master_array[sentence_id].usage_count
             ranked.append((sentence_id, final_score))
 
         ranked.sort(
             key=lambda item: (
                 -item[1],
-                self.master_array[item[0]].normalized_text,
-                self.master_array[item[0]].original_text,
-                self.master_array[item[0]].source_path,
-                self.master_array[item[0]].line_number,
+                master_array[item[0]].normalized_text,
+                master_array[item[0]].original_text,
+                master_array[item[0]].source_path,
+                master_array[item[0]].line_number,
                 item[0],
             )
         )
 
         results: list[tuple[int, AutoCompleteData]] = []
         for sentence_id, final_score in ranked[:k]:
-            record = self.master_array[sentence_id]
+            record = master_array[sentence_id]
             results.append(
                 (
                     sentence_id,
@@ -173,7 +217,7 @@ class AutocompleteSystem:
             normalized_query=normalized_query,
             requested_k=k,
             ranking_mode=mode.value,
-            backend=type(self.index).__name__,
+            backend=type(index).__name__,
             candidate_count=len(text_scores),
             result_count=len(results),
             results=[
@@ -195,7 +239,7 @@ class AutocompleteSystem:
             best_id, best_data = results[0]
             # A score < 2*len means we used a 1-edit penalty to find it
             if best_data.score < 2 * len(normalized_query):
-                record_norm = self.master_array[best_id].normalized_text
+                record_norm = master_array[best_id].normalized_text
                 # Find which 1-edit variant successfully matched
                 from autocomplete_system.scoring import generate_scored_variants
 
@@ -282,11 +326,14 @@ class AutocompleteSystem:
     def record_selection(self, sentence_id: int) -> None:
         """Increment one selected sentence's usage count."""
 
-        if sentence_id < 0 or sentence_id >= len(self.master_array):
+        # Capture once: see the comment in get_ranked_completions about a
+        # concurrent snapshot activation possibly reassigning master_array.
+        master_array = self.master_array
+        if sentence_id < 0 or sentence_id >= len(master_array):
             raise IndexError(f"Unknown sentence ID: {sentence_id}")
-        self.master_array[sentence_id].usage_count += 1
+        master_array[sentence_id].usage_count += 1
         self._has_usage_counts = True
-        record = self.master_array[sentence_id]
+        record = master_array[sentence_id]
         log_event(
             LOGGER,
             "selection_recorded",

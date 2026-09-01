@@ -20,6 +20,7 @@ from autocomplete_system.engine import AutocompleteSystem
 from autocomplete_system.logging_config import configure_system_logging, log_event
 from autocomplete_system.models import AutoCompleteData, RankingMode
 from autocomplete_system.normalization import normalize_text
+from autocomplete_system.snapshot import SnapshotWatcher
 from autocomplete_system.storage import load_ranking_mode_setting
 from translation import InputAdaptationPipeline, SigmaPolicy
 
@@ -160,6 +161,7 @@ def create_request_handler(
                 "/api/admin/actions/reset-analytics": self._reset_analytics,
                 "/api/admin/actions/reset-popularity": self._reset_popularity,
                 "/api/admin/actions/rebuild-index": self._start_rebuild,
+                "/api/admin/actions/activate-rebuild": self._activate_rebuild,
             }
             action = admin_actions.get(request_path)
             if action is not None:
@@ -574,6 +576,48 @@ def create_request_handler(
                 },
             )
 
+        def _activate_rebuild(self) -> None:
+            payload = self._confirmed_admin_payload("ACTIVATE SNAPSHOT")
+            if payload is None:
+                return
+            assert admin_service is not None and analytics is not None
+            target_directory = payload.get("target_directory")
+            if target_directory is not None and not isinstance(target_directory, str):
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {"error": "target_directory must be a string."},
+                )
+                return
+            try:
+                snapshot = admin_service.activate_rebuild(target_directory)
+            except (FileNotFoundError, RuntimeError, ValueError) as error:
+                self._send_json(HTTPStatus.CONFLICT, {"error": str(error)})
+                return
+            analytics.record(
+                "admin_action",
+                action="activate_snapshot",
+                data_directory=snapshot.get("data_directory"),
+                **self._request_metadata(),
+            )
+            log_event(
+                LOGGER,
+                "admin_action_completed",
+                action="activate_snapshot",
+                snapshot=snapshot,
+                **self._request_metadata(),
+            )
+            self._send_json(
+                HTTPStatus.OK,
+                {
+                    "message": (
+                        "The replacement build was published as the active "
+                        "snapshot. The running service adopts it within a few "
+                        "seconds, with no restart."
+                    ),
+                    "snapshot": snapshot,
+                },
+            )
+
         def _confirmed_admin_payload(self, confirmation: str) -> dict[str, Any] | None:
             if not self._require_admin():
                 return None
@@ -781,6 +825,16 @@ def run_server(
     project_directory = Path(__file__).resolve().parent
     analytics = AnalyticsStore(system.data_directory or DEFAULT_DATA_DIRECTORY)
     admin_service = AdminService(system, analytics, project_directory)
+    # ZDT: poll the shared pointer file in the background and hot-swap this
+    # running system in place when a new snapshot is published -- by this
+    # server's own Admin action, or by a completely separate process (see
+    # activate_snapshot.py). No restart, no dropped requests.
+    snapshot_watcher = SnapshotWatcher(
+        admin_service.pointer_path,
+        system,
+        on_activate=admin_service.note_snapshot_activated,
+    )
+    snapshot_watcher.start()
     analytics.record(
         "server_start",
         host=host,
@@ -805,6 +859,7 @@ def run_server(
     except KeyboardInterrupt:
         pass
     finally:
+        snapshot_watcher.stop()
         server.server_close()
         analytics.record("server_stop")
         log_event(LOGGER, "web_server_stopped", host=host, port=port)

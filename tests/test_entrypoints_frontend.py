@@ -14,6 +14,7 @@ from html.parser import HTMLParser
 from pathlib import Path
 from unittest.mock import Mock, patch
 
+import activate_snapshot as activate_snapshot_cli
 import benchmark
 import build_index as build_index_cli
 import main as cli
@@ -21,6 +22,7 @@ import web_app
 from autocomplete_system.engine import AutocompleteSystem
 from autocomplete_system.indexer import build_index
 from autocomplete_system.models import RankingMode
+from autocomplete_system.snapshot import read_snapshot_pointer
 from autocomplete_system.storage import load_index, save_index
 
 
@@ -102,6 +104,21 @@ class EntrypointTests(unittest.TestCase):
         self.assertEqual(web_args.port, 9000)
         self.assertEqual(web_args.mode, RankingMode.ASSIGNMENT)
 
+        with patch.object(
+            sys,
+            "argv",
+            [
+                "activate_snapshot.py",
+                "--data-dir",
+                "rebuilds/data-rebuild-1",
+                "--pointer",
+                "rebuilds/active_snapshot.json",
+            ],
+        ):
+            activate_args = activate_snapshot_cli.parse_args()
+        self.assertEqual(activate_args.data_dir, Path("rebuilds/data-rebuild-1"))
+        self.assertEqual(activate_args.pointer, Path("rebuilds/active_snapshot.json"))
+
     def test_offline_cli_builds_loadable_trie_and_sqlite_indexes(self) -> None:
         for backend in ("trie", "sqlite"):
             with self.subTest(backend=backend):
@@ -130,6 +147,38 @@ class EntrypointTests(unittest.TestCase):
                     self.assertIn(f"using {backend}", output.getvalue())
                 finally:
                     loaded.close()
+
+    def test_activate_snapshot_cli_publishes_the_pointer_atomically(self) -> None:
+        data_directory = self.root / "data-trie"
+        index, master = build_index(self.corpus)
+        save_index(data_directory, index, master)
+        pointer_path = self.root / "rebuilds" / "active_snapshot.json"
+        arguments = argparse.Namespace(data_dir=data_directory, pointer=pointer_path)
+
+        output = io.StringIO()
+        with (
+            patch.object(activate_snapshot_cli, "parse_args", return_value=arguments),
+            patch.object(activate_snapshot_cli, "configure_system_logging"),
+            redirect_stdout(output),
+        ):
+            activate_snapshot_cli.main()
+
+        record = read_snapshot_pointer(pointer_path)
+        assert record is not None
+        self.assertEqual(record["data_directory"], str(data_directory.resolve()))
+        self.assertIn(str(data_directory.resolve()), output.getvalue())
+
+    def test_activate_snapshot_cli_reports_an_unbuilt_snapshot(self) -> None:
+        arguments = argparse.Namespace(
+            data_dir=self.root / "never-built",
+            pointer=self.root / "rebuilds" / "active_snapshot.json",
+        )
+        with (
+            patch.object(activate_snapshot_cli, "parse_args", return_value=arguments),
+            patch.object(activate_snapshot_cli, "configure_system_logging"),
+            self.assertRaises(FileNotFoundError),
+        ):
+            activate_snapshot_cli.main()
 
     def test_sqlite_offline_cli_prints_the_progress_callback(self) -> None:
         arguments = argparse.Namespace(

@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from .constants import (
+    ACTIVE_SNAPSHOT_POINTER_FILENAME,
     ALPHA,
     ANALYTICS_EVENTS_FILENAME,
     DEFAULT_INPUT_SOURCES,
@@ -30,6 +31,7 @@ from .logging_config import (
     SYSTEM_LOG_FILENAME,
 )
 from .models import RankingMode
+from .snapshot import read_snapshot_pointer, write_snapshot_pointer
 from .storage import save_ranking_mode_setting
 
 
@@ -361,6 +363,7 @@ class AdminService:
         project_directory: Path,
         started_monotonic: float | None = None,
         rebuild_manager: RebuildManager | None = None,
+        pointer_path: Path | None = None,
     ) -> None:
         self.system = system
         self.analytics = analytics
@@ -373,6 +376,11 @@ class AdminService:
             self.project_directory,
             source,
             rebuild_parent,
+        )
+        self.pointer_path = (
+            Path(pointer_path)
+            if pointer_path is not None
+            else rebuild_parent / ACTIVE_SNAPSHOT_POINTER_FILENAME
         )
         self._static_corpus: dict[str, object] | None = None
         self._usage_by_id: dict[int, int] | None = None
@@ -527,6 +535,7 @@ class AdminService:
             "storage": self._storage(),
             "analytics": self.analytics.summary(),
             "rebuild": self.rebuild_manager.status(),
+            "snapshot": self.snapshot_status(),
         }
 
     def sentences_page(self, offset: int, limit: int) -> dict[str, object]:
@@ -667,3 +676,48 @@ class AdminService:
 
     def start_rebuild(self) -> dict[str, object]:
         return self.rebuild_manager.start()
+
+    def activate_rebuild(self, target_directory: str | None = None) -> dict[str, object]:
+        """Validate and atomically publish one replacement build as active.
+
+        This only writes the pointer file at ``self.pointer_path``. The
+        in-memory hot swap itself is performed by whichever
+        ``SnapshotWatcher`` is polling that same pointer -- normally this
+        server's own, but activation works identically if a completely
+        separate process (for example ``activate_snapshot.py`` run against a
+        shared filesystem) published the pointer instead of this method.
+        """
+
+        if target_directory is not None:
+            resolved_target = Path(target_directory)
+        else:
+            status = self.rebuild_manager.status()
+            if status.get("state") != "completed" or not status.get("target_directory"):
+                raise RuntimeError(
+                    "No completed replacement build is available to activate."
+                )
+            resolved_target = Path(str(status["target_directory"]))
+        return write_snapshot_pointer(self.pointer_path, resolved_target)
+
+    def note_snapshot_activated(self, data_directory: Path) -> None:
+        """Invalidate cached corpus/popularity summaries after a hot swap.
+
+        Passed as the ``on_activate`` callback to ``SnapshotWatcher``: once
+        the watcher swaps in a new ``master_array`` the dashboard's static
+        corpus and popularity snapshots (keyed off the previous array) are
+        stale and must be recomputed on next use.
+        """
+
+        with self._static_lock:
+            self._static_corpus = None
+        with self._usage_lock:
+            self._usage_by_id = None
+            self._usage_total = 0
+
+    def snapshot_status(self) -> dict[str, object] | None:
+        """Return the currently published pointer record, if any."""
+
+        record = read_snapshot_pointer(self.pointer_path)
+        if record is None:
+            return None
+        return {**record, "pointer_path": str(self.pointer_path)}
