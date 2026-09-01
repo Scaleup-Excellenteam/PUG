@@ -9,6 +9,7 @@ from pathlib import Path
 
 from autocomplete_system.constants import DEFAULT_DATA_DIRECTORY
 from autocomplete_system.engine import AutocompleteSystem
+from autocomplete_system.logging_config import configure_system_logging
 from autocomplete_system.models import RankingMode
 
 DEFAULT_QUERIES = ("this is", "python algorithm", "the quick brown", "or knot")
@@ -29,6 +30,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    configure_system_logging()
     args = parse_args()
     if args.repeat < 1:
         raise ValueError("--repeat must be at least 1")

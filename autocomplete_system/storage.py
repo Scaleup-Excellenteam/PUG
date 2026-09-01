@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import logging
 import pickle
+import time
 from pathlib import Path
 from typing import Any, TypeAlias
 
@@ -14,10 +16,12 @@ from .constants import (
     USAGE_STATS_FILENAME,
 )
 from .models import SentenceRecord
+from .logging_config import log_event
 from .sqlite_index import SQLiteSubstringIndex
 from .trie import CompressedSuffixTrie
 
 SearchIndex: TypeAlias = CompressedSuffixTrie | SQLiteSubstringIndex
+LOGGER = logging.getLogger("autocomplete.storage")
 
 
 def _atomic_pickle_dump(path: Path, value: Any) -> None:
@@ -40,6 +44,14 @@ def save_index(
 ) -> None:
     """Serialize index metadata, the master array, and current usage counts."""
 
+    started = time.perf_counter()
+    log_event(
+        LOGGER,
+        "index_save_started",
+        data_directory=str(data_directory),
+        backend=type(index).__name__,
+        sentence_count=len(master_array),
+    )
     data_directory.mkdir(parents=True, exist_ok=True)
     if isinstance(index, SQLiteSubstringIndex):
         index.attach(data_directory)
@@ -53,11 +65,21 @@ def save_index(
     )
     _atomic_pickle_dump(data_directory / MASTER_ARRAY_FILENAME, master_array)
     save_usage_stats(data_directory, master_array)
+    log_event(
+        LOGGER,
+        "index_save_completed",
+        data_directory=str(data_directory),
+        backend=type(index).__name__,
+        sentence_count=len(master_array),
+        duration_ms=round((time.perf_counter() - started) * 1000, 3),
+    )
 
 
 def load_index(data_directory: Path) -> tuple[SearchIndex, list[SentenceRecord]]:
     """Load and validate the serialized search index and master sentence array."""
 
+    started = time.perf_counter()
+    log_event(LOGGER, "index_load_started", data_directory=str(data_directory))
     index_path = data_directory / INDEX_FILENAME
     master_path = data_directory / MASTER_ARRAY_FILENAME
     if not index_path.is_file() or not master_path.is_file():
@@ -93,6 +115,14 @@ def load_index(data_directory: Path) -> tuple[SearchIndex, list[SentenceRecord]]
         index.attach(data_directory)
 
     load_usage_stats(data_directory, master_array)
+    log_event(
+        LOGGER,
+        "index_load_completed",
+        data_directory=str(data_directory),
+        backend=type(index).__name__,
+        sentence_count=len(master_array),
+        duration_ms=round((time.perf_counter() - started) * 1000, 3),
+    )
     return index, master_array
 
 
@@ -129,6 +159,12 @@ def load_usage_stats(
         ):
             raise ValueError(f"Invalid usage-stat entry for sentence ID {raw_sentence_id}.")
         master_array[sentence_id].usage_count = raw_count
+    log_event(
+        LOGGER,
+        "usage_stats_loaded",
+        data_directory=str(data_directory),
+        nonzero_entries=len(raw_stats),
+    )
 
 
 def save_usage_stats(
@@ -145,3 +181,9 @@ def save_usage_stats(
     }
     serialized = json.dumps(stats, ensure_ascii=False, separators=(",", ":"))
     _atomic_write_text(data_directory / USAGE_STATS_FILENAME, serialized)
+    log_event(
+        LOGGER,
+        "usage_stats_persisted",
+        data_directory=str(data_directory),
+        nonzero_entries=len(stats),
+    )

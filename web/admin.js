@@ -1,6 +1,13 @@
 "use strict";
 
-const state = { dashboard: null, sentenceOffset: 0, sentenceLimit: 25, action: null };
+const state = {
+  dashboard: null,
+  sentenceOffset: 0,
+  sentenceLimit: 25,
+  action: null,
+  logRequestRunning: false,
+  logSearchTimer: null,
+};
 const actionDefinitions = {
   "reset-analytics": {
     title: "Reset all analytics?",
@@ -149,6 +156,77 @@ function renderRecentEvents(items, total) {
   }), 4);
 }
 
+function logLevelBadge(level) {
+  const badge = document.createElement("span");
+  badge.className = `log-level log-level--${String(level).toLowerCase()}`;
+  badge.textContent = level;
+  return badge;
+}
+
+function renderSystemLogs(data) {
+  const rows = data.records.map((event) => {
+    const row = document.createElement("tr");
+    const level = document.createElement("td"); level.append(logLevelBadge(event.level || "INFO"));
+    const jsonCell = document.createElement("td"); const details = document.createElement("details"); details.className = "log-json";
+    const summary = document.createElement("summary"); summary.textContent = "View JSON";
+    const pre = document.createElement("pre"); pre.textContent = JSON.stringify(event, null, 2); details.append(summary, pre); jsonCell.append(details);
+    row.append(
+      textCell(date(event.timestamp), "cell-muted"), level,
+      textCell(event.logger || "—"), textCell(event.event || "—"),
+      textCell(event.message || "—", "cell-sentence"), jsonCell,
+    );
+    return row;
+  });
+  replaceTable("system-log-records", rows, 6);
+  byId("log-file-size").textContent = bytes(data.bytes);
+  byId("log-record-count").textContent = `${number(data.record_count)} shown · ${number(data.scanned_lines)} recent lines scanned`;
+  byId("log-modified").textContent = `Modified ${date(data.modified_at)}`;
+  byId("log-malformed").textContent = `${number(data.malformed_lines)} malformed`;
+}
+
+async function loadLogFiles() {
+  const response = await fetch("/api/admin/log-files", { cache: "no-store" });
+  if (!response.ok) throw new Error("Log file list could not be loaded");
+  const payload = await response.json(); const select = byId("log-file"); const selected = select.value || "system.jsonl";
+  select.replaceChildren(...payload.files.map((file) => {
+    const option = document.createElement("option"); option.value = file.filename;
+    option.textContent = `${file.filename}${file.active ? " · active" : ""} · ${bytes(file.bytes)}`;
+    return option;
+  }));
+  if ([...select.options].some((option) => option.value === selected)) select.value = selected;
+}
+
+async function loadSystemLogs() {
+  if (state.logRequestRunning) return;
+  state.logRequestRunning = true;
+  const parameters = new URLSearchParams({
+    file: byId("log-file").value || "system.jsonl",
+    limit: byId("log-limit").value,
+    level: byId("log-level").value,
+    component: byId("log-component").value,
+    search: byId("log-search").value,
+  });
+  try {
+    const response = await fetch(`/api/admin/logs?${parameters}`, { cache: "no-store" });
+    const payload = await response.json(); if (!response.ok) throw new Error(payload.error || "Logs could not be loaded");
+    renderSystemLogs(payload);
+    byId("log-download").href = `/api/admin/logs/download?file=${encodeURIComponent(payload.filename)}`;
+  } catch (error) {
+    replaceTable("system-log-records", [], 6); byId("log-record-count").textContent = error.message;
+  } finally { state.logRequestRunning = false; }
+}
+
+function updateLiveIndicator() {
+  const enabled = byId("log-auto-refresh").checked; const indicator = byId("log-live-status");
+  indicator.classList.toggle("live-indicator--paused", !enabled);
+  indicator.lastChild.textContent = enabled ? "Live" : "Paused";
+}
+
+function scheduleLogFilter() {
+  window.clearTimeout(state.logSearchTimer);
+  state.logSearchTimer = window.setTimeout(loadSystemLogs, 250);
+}
+
 function renderRebuild(rebuild) {
   byId("rebuild-state").textContent = rebuild.state[0].toUpperCase() + rebuild.state.slice(1);
   byId("rebuild-target").textContent = rebuild.target_directory || "No replacement build has been started.";
@@ -220,11 +298,23 @@ byId("sentences-next").addEventListener("click", () => { state.sentenceOffset +=
 document.querySelectorAll(".admin-action").forEach((button) => button.addEventListener("click", () => openConfirmation(button.dataset.action)));
 byId("dialog-confirm").addEventListener("click", executeAction);
 byId("confirmation-dialog").addEventListener("close", () => { state.action = null; });
+byId("log-refresh").addEventListener("click", () => Promise.all([loadLogFiles(), loadSystemLogs()]));
+byId("log-file").addEventListener("change", loadSystemLogs);
+byId("log-level").addEventListener("change", loadSystemLogs);
+byId("log-limit").addEventListener("change", loadSystemLogs);
+byId("log-component").addEventListener("input", scheduleLogFilter);
+byId("log-search").addEventListener("input", scheduleLogFilter);
+byId("log-auto-refresh").addEventListener("change", updateLiveIndicator);
 
-Promise.all([loadDashboard(), loadSentences()]);
+Promise.all([loadDashboard(), loadSentences(), loadLogFiles().then(loadSystemLogs)]);
 fetch("/api/events", {
   method: "POST", headers: { "Content-Type": "application/json" },
   body: JSON.stringify({ event_type: "page_view", details: { page: "admin" } }),
   keepalive: true,
 }).catch(() => {});
 window.setInterval(() => loadDashboard(), 10000);
+window.setInterval(() => {
+  if (byId("log-auto-refresh").checked) {
+    loadLogFiles().then(loadSystemLogs).catch(() => {});
+  }
+}, 3000);

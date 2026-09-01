@@ -3,15 +3,18 @@
 from __future__ import annotations
 
 import argparse
+import logging
 from pathlib import Path
 
 from autocomplete_system.constants import DEFAULT_DATA_DIRECTORY
 from autocomplete_system.engine import AutocompleteSystem
+from autocomplete_system.logging_config import configure_system_logging, log_event
 from autocomplete_system.models import RankingMode
 
 
 READY_PROMPT = "The system is ready. Enter your text:"
 SUGGESTIONS_HEADER = "Here are 5 suggestions:"
+LOGGER = logging.getLogger("autocomplete.cli")
 
 
 def parse_args() -> argparse.Namespace:
@@ -40,6 +43,12 @@ def run_cli(system: AutocompleteSystem) -> None:
 
     current_input = ""
     previous_top_sentence_id: int | None = None
+    log_event(
+        LOGGER,
+        "cli_started",
+        ranking_mode=system.ranking_mode.value,
+        backend=type(system.index).__name__,
+    )
     print(READY_PROMPT)
     try:
         while True:
@@ -49,14 +58,26 @@ def run_cli(system: AutocompleteSystem) -> None:
                 break
 
             if user_input == "#":
+                selected_sentence_id = previous_top_sentence_id
                 if previous_top_sentence_id is not None:
                     system.record_selection(previous_top_sentence_id)
                 current_input = ""
                 previous_top_sentence_id = None
+                log_event(
+                    LOGGER,
+                    "cli_query_reset",
+                    selected_sentence_id=selected_sentence_id,
+                )
                 print(READY_PROMPT)
                 continue
 
             current_input += user_input
+            log_event(
+                LOGGER,
+                "cli_input_received",
+                input_fragment=user_input,
+                current_query=current_input,
+            )
             ranked = system.get_ranked_completions(current_input)
             previous_top_sentence_id = ranked[0][0] if ranked else None
             if not ranked:
@@ -75,9 +96,11 @@ def run_cli(system: AutocompleteSystem) -> None:
         if system.data_directory is not None:
             system.save_usage_stats()
         system.close()
+        log_event(LOGGER, "cli_stopped")
 
 
 def main() -> None:
+    configure_system_logging()
     args = parse_args()
     run_cli(AutocompleteSystem.load(args.data_dir, args.mode))
 

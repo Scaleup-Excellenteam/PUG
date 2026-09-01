@@ -104,6 +104,32 @@
         <div class="table-scroll"><table><thead><tr><th>Time</th><th>Type</th><th>Details</th><th>Client</th></tr></thead><tbody id="recent-events"></tbody></table></div>
       </section>
 
+      <section class="panel log-panel">
+        <div class="panel__heading">
+          <div><p class="eyebrow">Operations</p><h2>Live system logs</h2></div>
+          <span id="log-live-status" class="live-indicator"><i aria-hidden="true"></i>Live</span>
+        </div>
+        <div class="log-toolbar">
+          <label>File<select id="log-file"></select></label>
+          <label>Level<select id="log-level"><option value="">All levels</option><option>INFO</option><option>WARNING</option><option>ERROR</option><option>CRITICAL</option></select></label>
+          <label>Component<input id="log-component" placeholder="e.g. engine"></label>
+          <label class="log-search">Search<input id="log-search" type="search" placeholder="Search message, event, query or result"></label>
+          <label>Rows<select id="log-limit"><option>50</option><option selected>200</option><option>500</option></select></label>
+          <label class="auto-refresh"><input id="log-auto-refresh" type="checkbox" checked>Auto-refresh</label>
+          <button id="log-refresh" class="button button--quiet" type="button">Refresh</button>
+          <a id="log-download" class="button button--primary" href="/api/admin/logs/download?file=system.jsonl">Download file</a>
+        </div>
+        <div class="log-meta">
+          <span id="log-file-size">—</span><span id="log-record-count">— records</span><span id="log-modified">—</span><span id="log-malformed">—</span>
+        </div>
+        <div class="table-scroll log-table-scroll">
+          <table class="log-table">
+            <thead><tr><th>Timestamp</th><th>Level</th><th>Component</th><th>Event</th><th>Message</th><th>Full JSON</th></tr></thead>
+            <tbody id="system-log-records"></tbody>
+          </table>
+        </div>
+      </section>
+
       <section class="panel">
         <div class="panel__heading"><div><p class="eyebrow">Operations</p><h2>Administrative actions</h2></div><span class="panel__note">Destructive actions require typed confirmation</span></div>
         <div class="action-grid">

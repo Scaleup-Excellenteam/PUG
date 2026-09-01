@@ -3,10 +3,16 @@
 from __future__ import annotations
 
 import io
+import logging
 import zipfile
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+
+from .logging_config import log_event
+
+
+LOGGER = logging.getLogger("autocomplete.sources")
 
 
 @dataclass(frozen=True, slots=True)
@@ -24,8 +30,24 @@ def _iter_decoded_lines(stream: io.TextIOBase, source_path: str) -> Iterator[Sou
 
 
 def _iter_text_file(path: Path, display_path: str) -> Iterator[SourceLine]:
+    count = 0
+    log_event(
+        LOGGER,
+        "source_file_started",
+        filesystem_path=str(path),
+        source_path=display_path,
+    )
     with path.open("r", encoding="utf-8") as source_file:
-        yield from _iter_decoded_lines(source_file, display_path)
+        for source_line in _iter_decoded_lines(source_file, display_path):
+            count += 1
+            yield source_line
+    log_event(
+        LOGGER,
+        "source_file_completed",
+        filesystem_path=str(path),
+        source_path=display_path,
+        nonblank_line_count=count,
+    )
 
 
 def _iter_zip(path: Path) -> Iterator[SourceLine]:
@@ -38,16 +60,50 @@ def _iter_zip(path: Path) -> Iterator[SourceLine]:
             ),
             key=lambda entry: entry.filename,
         )
+        log_event(
+            LOGGER,
+            "zip_source_opened",
+            archive_path=str(path),
+            text_entry_count=len(entries),
+        )
         for entry in entries:
+            count = 0
+            log_event(
+                LOGGER,
+                "zip_entry_started",
+                archive_path=str(path),
+                source_path=entry.filename,
+                compressed_bytes=entry.compress_size,
+                uncompressed_bytes=entry.file_size,
+            )
             with archive.open(entry, "r") as binary_stream:
                 with io.TextIOWrapper(binary_stream, encoding="utf-8") as text_stream:
-                    yield from _iter_decoded_lines(text_stream, entry.filename)
+                    for source_line in _iter_decoded_lines(text_stream, entry.filename):
+                        count += 1
+                        yield source_line
+            log_event(
+                LOGGER,
+                "zip_entry_completed",
+                archive_path=str(path),
+                source_path=entry.filename,
+                nonblank_line_count=count,
+            )
 
 
 def iter_source_lines(sources: Sequence[Path]) -> Iterator[SourceLine]:
     """Yield every nonblank line from the configured sources deterministically."""
 
     for source in sorted((Path(item) for item in sources), key=lambda path: str(path)):
+        log_event(
+            LOGGER,
+            "input_source_started",
+            source=str(source),
+            source_type=(
+                "directory"
+                if source.is_dir()
+                else source.suffix.lower().removeprefix(".") or "unknown"
+            ),
+        )
         if not source.exists():
             raise FileNotFoundError(f"Input source does not exist: {source}")
 

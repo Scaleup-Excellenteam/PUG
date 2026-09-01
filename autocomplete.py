@@ -6,6 +6,7 @@ from pathlib import Path
 
 from autocomplete_system.constants import DEFAULT_DATA_DIRECTORY
 from autocomplete_system.engine import AutocompleteSystem
+from autocomplete_system.logging_config import configure_system_logging
 from autocomplete_system.models import AutoCompleteData, RankingMode
 
 _system: AutocompleteSystem | None = None
@@ -17,6 +18,7 @@ def initialize(
 ) -> None:
     """Load the serialized index used by the module-level search function."""
 
+    configure_system_logging()
     global _system
     if _system is not None:
         _system.close()

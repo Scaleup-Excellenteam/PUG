@@ -2,13 +2,19 @@
 
 from __future__ import annotations
 
+import logging
+import time
 from pathlib import Path
 
 from .constants import ALPHA
 from .models import AutoCompleteData, RankingMode, SentenceRecord
+from .logging_config import log_event
 from .normalization import normalize_text
 from .sqlite_index import SQLiteSubstringIndex
 from .storage import SearchIndex, load_index, save_usage_stats
+
+
+LOGGER = logging.getLogger("autocomplete.engine")
 
 
 class AutocompleteSystem:
@@ -39,8 +45,25 @@ class AutocompleteSystem:
         data_directory: Path,
         ranking_mode: RankingMode = RankingMode.ASSIGNMENT,
     ) -> AutocompleteSystem:
+        started = time.perf_counter()
+        log_event(
+            LOGGER,
+            "system_load_started",
+            data_directory=str(data_directory),
+            ranking_mode=ranking_mode.value,
+        )
         index, master_array = load_index(data_directory)
-        return cls(index, master_array, data_directory, ranking_mode)
+        system = cls(index, master_array, data_directory, ranking_mode)
+        log_event(
+            LOGGER,
+            "system_load_completed",
+            data_directory=str(data_directory),
+            ranking_mode=ranking_mode.value,
+            backend=type(index).__name__,
+            sentence_count=len(master_array),
+            duration_ms=round((time.perf_counter() - started) * 1000, 3),
+        )
+        return system
 
     def get_ranked_completions(
         self,
@@ -50,8 +73,20 @@ class AutocompleteSystem:
     ) -> list[tuple[int, AutoCompleteData]]:
         """Return result IDs and public completion records, best first."""
 
+        started = time.perf_counter()
         normalized_query = normalize_text(prefix)
         if not normalized_query or k <= 0:
+            log_event(
+                LOGGER,
+                "search_completed",
+                query=prefix,
+                normalized_query=normalized_query,
+                requested_k=k,
+                result_count=0,
+                results=[],
+                duration_ms=round((time.perf_counter() - started) * 1000, 3),
+                reason="empty_normalized_query_or_nonpositive_k",
+            )
             return []
 
         mode = self.ranking_mode if ranking_mode is None else ranking_mode
@@ -97,6 +132,28 @@ class AutocompleteSystem:
                     ),
                 )
             )
+        log_event(
+            LOGGER,
+            "search_completed",
+            query=prefix,
+            normalized_query=normalized_query,
+            requested_k=k,
+            ranking_mode=mode.value,
+            backend=type(self.index).__name__,
+            candidate_count=len(text_scores),
+            result_count=len(results),
+            results=[
+                {
+                    "sentence_id": sentence_id,
+                    "completed_sentence": completion.completed_sentence,
+                    "source_text": completion.source_text,
+                    "offset": completion.offset,
+                    "score": completion.score,
+                }
+                for sentence_id, completion in results
+            ],
+            duration_ms=round((time.perf_counter() - started) * 1000, 3),
+        )
         return results
 
     def get_best_k_completions(self, prefix: str) -> list[AutoCompleteData]:
@@ -111,6 +168,16 @@ class AutocompleteSystem:
             raise IndexError(f"Unknown sentence ID: {sentence_id}")
         self.master_array[sentence_id].usage_count += 1
         self._has_usage_counts = True
+        record = self.master_array[sentence_id]
+        log_event(
+            LOGGER,
+            "selection_recorded",
+            sentence_id=sentence_id,
+            completed_sentence=record.original_text,
+            source_text=record.source_path,
+            offset=record.line_number,
+            usage_count=record.usage_count,
+        )
 
     def reset_usage_counts(self) -> None:
         """Reset every popularity counter without changing the search index."""
@@ -118,6 +185,11 @@ class AutocompleteSystem:
         for record in self.master_array:
             record.usage_count = 0
         self._has_usage_counts = False
+        log_event(
+            LOGGER,
+            "popularity_reset",
+            sentence_count=len(self.master_array),
+        )
 
     def save_usage_stats(self) -> None:
         """Persist popularity data when this system has a data directory."""
@@ -125,9 +197,15 @@ class AutocompleteSystem:
         if self.data_directory is None:
             raise ValueError("No data directory is configured for this system.")
         save_usage_stats(self.data_directory, self.master_array)
+        log_event(
+            LOGGER,
+            "usage_stats_saved",
+            data_directory=str(self.data_directory),
+        )
 
     def close(self) -> None:
         """Release resources held by a disk-backed index."""
 
         if isinstance(self.index, SQLiteSubstringIndex):
             self.index.close()
+        log_event(LOGGER, "system_closed", backend=type(self.index).__name__)
