@@ -47,7 +47,7 @@
           <span>Successful searches</span><strong id="metric-success">—</strong><small id="metric-no-results">— without results</small>
         </article>
         <article class="metric-card metric-card--green">
-          <span>Selections</span><strong id="metric-selections">—</strong><small id="metric-popularity">— popularity events</small>
+          <span>Persistent popularity</span><strong id="metric-selections">—</strong><small id="metric-popularity">— selections in the analytics log</small>
         </article>
         <article class="metric-card metric-card--violet">
           <span>P95 search latency</span><strong id="metric-p95">—</strong><small id="metric-average">— average</small>
@@ -78,8 +78,8 @@
           <div class="table-scroll"><table><thead><tr><th>Query</th><th>Count</th><th>Voice</th><th>No result</th><th>Avg.</th></tr></thead><tbody id="top-queries"></tbody></table></div>
         </article>
         <article class="panel">
-          <div class="panel__heading"><div><p class="eyebrow">Engagement</p><h2>Top selected sentences</h2></div></div>
-          <div class="table-scroll"><table><thead><tr><th>Sentence</th><th>Source</th><th>Selections</th></tr></thead><tbody id="top-selections"></tbody></table></div>
+          <div class="panel__heading"><div><p class="eyebrow">Ranking</p><h2>Persistent popularity</h2></div><span class="panel__note">Loaded from usage_stats.json · survives restart</span></div>
+          <div class="table-scroll"><table><thead><tr><th>Sentence</th><th>Source</th><th>Usage count</th><th>Score bonus</th></tr></thead><tbody id="top-selections"></tbody></table></div>
         </article>
       </section>
 
@@ -133,6 +133,11 @@
       <section class="panel">
         <div class="panel__heading"><div><p class="eyebrow">Operations</p><h2>Administrative actions</h2></div><span class="panel__note">Destructive actions require typed confirmation</span></div>
         <div class="action-grid">
+          <article id="popularity-control" class="action-card popularity-control">
+            <span class="action-card__icon action-card__icon--green">★</span><h3>Popularity ranking</h3>
+            <p id="popularity-control-description">Loading the current ranking mode…</p>
+            <button id="toggle-popularity" class="button button--quiet" type="button" role="switch" aria-checked="false" disabled>Loading…</button>
+          </article>
           <article class="action-card">
             <span class="action-card__icon action-card__icon--blue">⇩</span><h3>Export analytics</h3><p>Download the complete append-only activity history.</p>
             <div class="button-row"><a class="button button--primary" href="/api/admin/export?format=json">Export JSON</a><a class="button button--quiet" href="/api/admin/export?format=csv">Export CSV</a></div>

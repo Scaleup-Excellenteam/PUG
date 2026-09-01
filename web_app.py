@@ -20,6 +20,7 @@ from autocomplete_system.engine import AutocompleteSystem
 from autocomplete_system.logging_config import configure_system_logging, log_event
 from autocomplete_system.models import AutoCompleteData, RankingMode
 from autocomplete_system.normalization import normalize_text
+from autocomplete_system.storage import load_ranking_mode_setting
 
 
 DEFAULT_HOST = "127.0.0.1"
@@ -106,6 +107,9 @@ def create_request_handler(
                 return
             if request_path == "/api/events":
                 self._record_client_event()
+                return
+            if request_path == "/api/admin/settings/popularity":
+                self._set_popularity_enabled()
                 return
             admin_actions = {
                 "/api/admin/actions/reset-analytics": self._reset_analytics,
@@ -414,6 +418,47 @@ def create_request_handler(
             )
             self._send_json(HTTPStatus.OK, {"message": "Popularity data was reset."})
 
+        def _set_popularity_enabled(self) -> None:
+            if not self._require_admin():
+                return
+            payload = self._read_json_body()
+            if payload is None:
+                return
+            enabled = payload.get("enabled")
+            if not isinstance(enabled, bool):
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {"error": "enabled must be a boolean."},
+                )
+                return
+
+            assert admin_service is not None and analytics is not None
+            ranking_mode = admin_service.set_popularity_enabled(enabled)
+            analytics.record(
+                "admin_action",
+                action="set_popularity_enabled",
+                enabled=enabled,
+                ranking_mode=ranking_mode.value,
+                **self._request_metadata(),
+            )
+            log_event(
+                LOGGER,
+                "admin_action_completed",
+                action="set_popularity_enabled",
+                enabled=enabled,
+                ranking_mode=ranking_mode.value,
+                **self._request_metadata(),
+            )
+            state = "enabled" if enabled else "disabled"
+            self._send_json(
+                HTTPStatus.OK,
+                {
+                    "message": f"Popularity weighting is now {state}.",
+                    "popularity_enabled": enabled,
+                    "ranking_mode": ranking_mode.value,
+                },
+            )
+
         def _start_rebuild(self) -> None:
             payload = self._confirmed_admin_payload("REBUILD INDEX")
             if payload is None:
@@ -627,10 +672,10 @@ def parse_args() -> argparse.Namespace:
         "--mode",
         type=RankingMode,
         choices=list(RankingMode),
-        default=RankingMode.POPULARITY,
+        default=None,
         help=(
-            "Ranking mode: popularity makes clicked suggestions affect future ranking; "
-            "assignment preserves the official text-only score."
+            "Override the saved web ranking mode for this run. Without this option, "
+            "the saved Admin preference is used, defaulting to popularity."
         ),
     )
     parser.add_argument("--host", default=DEFAULT_HOST)
@@ -684,7 +729,11 @@ def run_server(
 def main() -> None:
     configure_system_logging()
     args = parse_args()
-    system = AutocompleteSystem.load(args.data_dir, args.mode)
+    ranking_mode = args.mode or load_ranking_mode_setting(
+        args.data_dir,
+        RankingMode.POPULARITY,
+    )
+    system = AutocompleteSystem.load(args.data_dir, ranking_mode)
     run_server(system, args.host, args.port)
 
 

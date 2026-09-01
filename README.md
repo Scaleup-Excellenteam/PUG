@@ -90,6 +90,14 @@ results. To preserve the assignment's official text-only score and ordering:
 python web_app.py --mode assignment
 ```
 
+The Admin dashboard also provides a **Popularity ranking** switch. Turning it
+off immediately removes `5 * usage_count` from search scores without erasing
+any counters. Both states search the same length-ranked node cache; the switch
+changes only the final score and ranking within that fixed candidate pool. The
+selected mode is stored in `data/ranking_settings.json` and
+is restored on the next normal website start. An explicit `--mode` argument
+overrides that saved preference for the current run.
+
 The server binds to `127.0.0.1` by default, so it is accessible only from the
 local computer. Stop it with `Ctrl+C`; usage statistics are saved both after
 each selection and during graceful shutdown.
@@ -113,7 +121,9 @@ password. It provides:
   search, result IDs and scores, input method, latency, selection, local client
   metadata, error, server lifecycle event, and administrative action;
 - search totals, typed/voice split, no-result rate, unique and top queries,
-  P50/P95/maximum latency, top selections, hourly activity, and recent events;
+  P50/P95/maximum latency, hourly activity, and recent events;
+- persistent popularity loaded from `usage_stats.json`, including each sentence's
+  usage count and `5 * usage_count` ranking bonus, independently of analytics logs;
 - paginated access to every Master Array record;
 - complete JSON and CSV analytics exports;
 - confirmed actions for resetting analytics or popularity data; and

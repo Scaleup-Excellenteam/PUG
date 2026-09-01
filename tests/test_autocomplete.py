@@ -155,6 +155,41 @@ class AutocompleteTests(unittest.TestCase):
         expected_alphabet = set(sorted(lines)[:MAX_NODE_CACHE_SIZE])
         self.assertEqual(cached_alphabet_texts, expected_alphabet)
 
+    def test_popularity_toggle_keeps_the_same_candidate_pool(self) -> None:
+        cache_corpus = self.root / "toggle-corpus"
+        cache_corpus.mkdir()
+        lines = [
+            f"Name{number:02d} common {'x' * (25 - number)}"
+            for number in range(25)
+        ]
+        (cache_corpus / "cache.txt").write_text(
+            "\n".join(reversed(lines)) + "\n",
+            encoding="utf-8",
+        )
+        index, master_array = build_index(cache_corpus)
+        system = AutocompleteSystem(index, master_array)
+        self.systems_to_close.append(system)
+
+        assignment_ids = {
+            sentence_id
+            for sentence_id, _ in system.get_ranked_completions(
+                "common",
+                k=MAX_NODE_CACHE_SIZE,
+                ranking_mode=RankingMode.ASSIGNMENT,
+            )
+        }
+        popularity_ids = {
+            sentence_id
+            for sentence_id, _ in system.get_ranked_completions(
+                "common",
+                k=MAX_NODE_CACHE_SIZE,
+                ranking_mode=RankingMode.POPULARITY,
+            )
+        }
+
+        self.assertEqual(assignment_ids, popularity_ids)
+        self.assertEqual(len(assignment_ids), MAX_NODE_CACHE_SIZE)
+
     def test_zip_input_preserves_entry_path_and_line_offset(self) -> None:
         archive_path = self.root / "Archive.zip"
         with zipfile.ZipFile(archive_path, "w") as archive:
@@ -181,6 +216,39 @@ class AutocompleteTests(unittest.TestCase):
                 trie_results = self.system.get_best_k_completions(query)
                 sqlite_results = sqlite_system.get_best_k_completions(query)
                 self.assertEqual(sqlite_results, trie_results)
+
+    def test_sqlite_legacy_candidate_orders_and_detached_guard(self) -> None:
+        cache_corpus = self.root / "sqlite-cache-corpus"
+        cache_corpus.mkdir()
+        lines = [
+            f"Name{number:02d} common {'x' * (25 - number)}"
+            for number in range(25)
+        ]
+        (cache_corpus / "cache.txt").write_text(
+            "\n".join(reversed(lines)) + "\n",
+            encoding="utf-8",
+        )
+        sqlite_data = self.root / "sqlite-cache-data"
+        sqlite_index, sqlite_master = build_sqlite_index(cache_corpus, sqlite_data)
+        sqlite_system = AutocompleteSystem(sqlite_index, sqlite_master)
+        self.systems_to_close.append(sqlite_system)
+
+        by_length = sqlite_index.candidate_text_scores(
+            "common",
+            RankingMode.POPULARITY,
+            allow_popularity_exact_shortcut=True,
+        )
+        by_alphabet = sqlite_index.candidate_text_scores(
+            "common",
+            RankingMode.ASSIGNMENT,
+        )
+        self.assertEqual(len(by_length), MAX_NODE_CACHE_SIZE)
+        self.assertEqual(len(by_alphabet), MAX_NODE_CACHE_SIZE)
+        self.assertNotEqual(set(by_length), set(by_alphabet))
+
+        detached = type(sqlite_index)("missing.sqlite3", (), {}, {})
+        with self.assertRaises(RuntimeError):
+            detached.candidate_text_scores("demo", RankingMode.POPULARITY)
 
     def test_long_one_edit_anchor_search_matches_trie(self) -> None:
         corpus = self.root / "long-edit-corpus"

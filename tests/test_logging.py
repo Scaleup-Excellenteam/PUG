@@ -2,9 +2,13 @@ from __future__ import annotations
 
 import json
 import logging
+import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from autocomplete_system.engine import AutocompleteSystem
 from autocomplete_system.indexer import build_index
@@ -17,8 +21,96 @@ from autocomplete_system.logging_config import (
 
 
 class SystemLoggingTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.original_exception_hook = sys.excepthook
+        self.original_thread_exception_hook = threading.excepthook
+
     def tearDown(self) -> None:
         shutdown_system_logging()
+        sys.excepthook = self.original_exception_hook
+        threading.excepthook = self.original_thread_exception_hook
+
+    def test_invalid_rotation_configuration_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            with self.assertRaises(ValueError):
+                configure_system_logging(directory, max_bytes=0)
+            with self.assertRaises(ValueError):
+                configure_system_logging(directory, backup_count=-1)
+
+    def test_repeated_configuration_reuses_the_existing_handler(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            first = configure_system_logging(
+                directory,
+                force=True,
+                install_exception_hooks=False,
+            )
+            second = configure_system_logging(
+                directory / "ignored",
+                install_exception_hooks=False,
+            )
+            self.assertEqual(first, second)
+            owned_handlers = [
+                handler
+                for handler in logging.getLogger("autocomplete").handlers
+                if getattr(handler, "_autocomplete_system_handler", False)
+            ]
+            self.assertEqual(len(owned_handlers), 1)
+            shutdown_system_logging()
+
+    def test_exception_information_and_uncaught_hooks_are_logged(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = configure_system_logging(
+                Path(temporary_directory),
+                force=True,
+                install_exception_hooks=True,
+            )
+            try:
+                raise RuntimeError("logged failure")
+            except RuntimeError:
+                log_event(
+                    logging.getLogger("autocomplete.test"),
+                    "handled_failure",
+                    exc_info=True,
+                )
+
+            try:
+                raise ValueError("uncaught failure")
+            except ValueError:
+                exception_type, exception, traceback = sys.exc_info()
+                assert exception_type is not None and exception is not None
+                sys.excepthook(exception_type, exception, traceback)
+
+            thread_args = SimpleNamespace(
+                thread=threading.current_thread(),
+                exc_type=LookupError,
+                exc_value=LookupError("thread failure"),
+                exc_traceback=None,
+            )
+            threading.excepthook(thread_args)
+
+            events = [json.loads(line) for line in path.read_text("utf-8").splitlines()]
+            handled = next(item for item in events if item["event"] == "handled_failure")
+            self.assertIn("RuntimeError: logged failure", handled["exception"])
+            self.assertTrue(any(item["event"] == "uncaught_exception" for item in events))
+            self.assertTrue(
+                any(item["event"] == "uncaught_thread_exception" for item in events)
+            )
+            shutdown_system_logging()
+
+    def test_keyboard_interrupt_is_delegated_to_the_original_hook(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            with patch.object(sys, "__excepthook__") as original_hook:
+                configure_system_logging(
+                    Path(temporary_directory),
+                    force=True,
+                    install_exception_hooks=True,
+                )
+                interrupt = KeyboardInterrupt()
+                sys.excepthook(KeyboardInterrupt, interrupt, None)
+                original_hook.assert_called_once_with(KeyboardInterrupt, interrupt, None)
+                shutdown_system_logging()
 
     def test_events_are_valid_utf8_json_and_flush_immediately(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
