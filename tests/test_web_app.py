@@ -604,6 +604,48 @@ class WebApplicationTests(unittest.TestCase):
         self.assertEqual(events[0]["event_type"], "client_event")
         self.assertEqual(events[0]["client_event_type"], "voice_error")
 
+    def test_suggestions_remaps_hebrew_keyboard_layout_and_returns_metadata(self) -> None:
+        # "יקךךם" URL-encoded is "%D7%99%D7%A7%D7%9A%D7%9A%D7%9D" -> remapped behind-the-scenes to "hello"
+        payload = self.read_json("/api/suggestions?query=%D7%99%D7%A7%D7%9A%D7%9A%D7%9D")
+        self.assertTrue(payload.get("was_adapted"))
+        self.assertEqual(payload.get("original_query"), "יקךךם")
+        self.assertEqual(payload.get("adapted_query"), "hello")
+        self.assertFalse(payload.get("is_blocked"))
+        self.assertGreater(len(payload.get("suggestions", [])), 0)
+        self.assertEqual(payload["suggestions"][0]["completed_sentence"], "Hello, world!")
+
+    def test_suggestions_reports_sigma_warnings_and_blocks(self) -> None:
+        from translation import InputAdaptationPipeline, SigmaPolicy
+
+        # Default server warning on non-alphabetic characters that can't be mapped
+        payload = self.read_json("/api/suggestions?query=hello%20%F0%9F%98%8A")
+        self.assertIn("symbols outside allowed alphabet Sigma", payload.get("warning", ""))
+
+        # When blocked by policy
+        blocked_server = create_server(
+            self.system,
+            port=0,
+            pipeline=InputAdaptationPipeline(
+                enable_keymap=False,
+                sigma_policy=SigmaPolicy.BLOCK,
+            ),
+        )
+        thread = threading.Thread(target=blocked_server.serve_forever, daemon=True)
+        thread.start()
+        host, port = blocked_server.server_address
+        try:
+            blocked_payload = json.loads(
+                urlopen(f"http://{host}:{port}/api/suggestions?query=hello%20%F0%9F%98%8A", timeout=2)
+                .read()
+                .decode("utf-8")
+            )
+            self.assertTrue(blocked_payload.get("is_blocked"))
+            self.assertEqual(len(blocked_payload.get("suggestions", [])), 0)
+        finally:
+            blocked_server.shutdown()
+            thread.join(timeout=2)
+            blocked_server.server_close()
+
 
 class RebuildManagerTests(unittest.TestCase):
     def test_replacement_build_is_non_destructive_and_reports_completion(self) -> None:

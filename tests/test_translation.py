@@ -366,5 +366,27 @@ class CliAdaptationTests(unittest.TestCase):
         self.assertNotIn("[Warning]", rendered)
 
 
+class PipelineLoggingTests(unittest.TestCase):
+    """Test structured logging in InputAdaptationPipeline."""
+
+    def test_pipeline_emits_structured_logs_on_remap_and_sigma(self) -> None:
+        pipeline = InputAdaptationPipeline()
+        with patch("translation.pipeline.log_event") as mock_log:
+            pipeline.process("יקךךם")
+            mock_log.assert_called_once()
+            args, kwargs = mock_log.call_args
+            self.assertEqual(args[1], "input_remapped")
+            self.assertEqual(kwargs["original_query"], "יקךךם")
+            self.assertEqual(kwargs["remapped_query"], "hello")
+
+        pipeline_off = InputAdaptationPipeline(enable_keymap=False, sigma_policy=SigmaPolicy.BLOCK)
+        with patch("translation.pipeline.log_event") as mock_log:
+            pipeline_off.process("שלום")
+            mock_log.assert_called_once()
+            args, kwargs = mock_log.call_args
+            self.assertEqual(args[1], "sigma_violations_detected")
+            self.assertTrue(kwargs["is_blocked"])
+
+
 if __name__ == "__main__":
     unittest.main()

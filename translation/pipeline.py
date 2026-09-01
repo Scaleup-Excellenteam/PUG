@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
+
+from autocomplete_system.logging_config import log_event
 from .keyboard_layout import KeyboardLayoutMapper
 from .models import AdaptationMode, QueryAdaptationResult, SigmaPolicy, TokenAdaptation
 from .sigma_guard import SigmaGuard
 from .token_translator import TokenTranslator
+
+LOGGER = logging.getLogger("autocomplete.translation")
 
 
 class InputAdaptationPipeline:
@@ -96,6 +101,13 @@ class InputAdaptationPipeline:
                 )
                 current_query = remapped
                 keymap_applied = True
+                log_event(
+                    LOGGER,
+                    "input_remapped",
+                    original_query=query,
+                    remapped_query=current_query,
+                    method="keyboard_layout",
+                )
 
         # 2. Remote Token Translation (bridges foreign/forgotten words)
         if self.enable_translate:
@@ -105,9 +117,26 @@ class InputAdaptationPipeline:
                 detected_languages.extend(trans_langs)
                 current_query = translated_query
                 translation_applied = True
+                log_event(
+                    LOGGER,
+                    "tokens_translated",
+                    original_query=query,
+                    translated_query=current_query,
+                    detected_languages=sorted(set(detected_languages)),
+                )
 
         # 3. Validate against alphabet Sigma
         validation = self.guard.validate(current_query, policy=self.sigma_policy)
+        if validation.violations:
+            log_event(
+                LOGGER,
+                "sigma_violations_detected",
+                level=logging.WARNING if validation.is_blocked else logging.INFO,
+                query=current_query,
+                violations=validation.violations,
+                policy=self.sigma_policy.value,
+                is_blocked=validation.is_blocked,
+            )
 
         was_adapted = keymap_applied or translation_applied
         return QueryAdaptationResult(

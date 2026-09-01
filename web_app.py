@@ -21,6 +21,7 @@ from autocomplete_system.logging_config import configure_system_logging, log_eve
 from autocomplete_system.models import AutoCompleteData, RankingMode
 from autocomplete_system.normalization import normalize_text
 from autocomplete_system.storage import load_ranking_mode_setting
+from translation import InputAdaptationPipeline, SigmaPolicy
 
 
 DEFAULT_HOST = "127.0.0.1"
@@ -57,8 +58,16 @@ def create_request_handler(
     system: AutocompleteSystem,
     analytics: AnalyticsStore | None = None,
     admin_service: AdminService | None = None,
+    pipeline: InputAdaptationPipeline | None = None,
 ) -> type[BaseHTTPRequestHandler]:
     """Create an HTTP handler bound to one loaded autocomplete system."""
+
+    if pipeline is None:
+        pipeline = InputAdaptationPipeline(
+            enable_keymap=True,
+            enable_translate=False,
+            sigma_policy=SigmaPolicy.WARN,
+        )
 
     class AutocompleteRequestHandler(BaseHTTPRequestHandler):
         server_version = "AutocompleteWeb/1.0"
@@ -142,7 +151,35 @@ def create_request_handler(
                 input_method = "typed"
             started = time.perf_counter()
             try:
-                ranked = system.get_ranked_completions(query)
+                adaptation = pipeline.process(query)
+                if adaptation.was_adapted:
+                    log_event(
+                        LOGGER,
+                        "web_query_adapted",
+                        original_query=query,
+                        adapted_query=adaptation.final_query,
+                        keymap_applied=adaptation.keymap_applied,
+                        translation_applied=adaptation.translation_applied,
+                        **self._request_metadata(),
+                    )
+
+                if adaptation.is_blocked:
+                    self._send_json(
+                        HTTPStatus.OK,
+                        {
+                            "suggestions": [],
+                            "duration_ms": 0.0,
+                            "original_query": query,
+                            "adapted_query": adaptation.final_query,
+                            "was_adapted": False,
+                            "warning": adaptation.warning_message,
+                            "is_blocked": True,
+                        },
+                    )
+                    return
+
+                search_query = adaptation.final_query
+                ranked = system.get_ranked_completions(search_query)
                 payload = [
                     _completion_payload(sentence_id, completion)
                     for sentence_id, completion in ranked
@@ -152,7 +189,9 @@ def create_request_handler(
                     analytics.record(
                         "search",
                         query=query,
-                        normalized_query=normalize_text(query),
+                        normalized_query=normalize_text(search_query),
+                        adapted_query=adaptation.final_query,
+                        was_adapted=adaptation.was_adapted,
                         input_method=input_method,
                         duration_ms=duration_ms,
                         result_count=len(payload),
@@ -163,7 +202,15 @@ def create_request_handler(
                     )
                 self._send_json(
                     HTTPStatus.OK,
-                    {"suggestions": payload, "duration_ms": duration_ms},
+                    {
+                        "suggestions": payload,
+                        "duration_ms": duration_ms,
+                        "original_query": query,
+                        "adapted_query": adaptation.final_query,
+                        "was_adapted": adaptation.was_adapted,
+                        "warning": adaptation.warning_message,
+                        "is_blocked": False,
+                    },
                 )
             except Exception as error:
                 log_event(
@@ -665,12 +712,13 @@ def create_server(
     port: int = DEFAULT_PORT,
     analytics: AnalyticsStore | None = None,
     admin_service: AdminService | None = None,
+    pipeline: InputAdaptationPipeline | None = None,
 ) -> HTTPServer:
     """Create the single-user local HTTP server without starting it."""
 
     return HTTPServer(
         (host, port),
-        create_request_handler(system, analytics, admin_service),
+        create_request_handler(system, analytics, admin_service, pipeline),
     )
 
 
