@@ -100,6 +100,17 @@ def create_request_handler(
                 return
             self._serve_static_file(static_name)
 
+        def _drain_body(self) -> None:
+            try:
+                headers = getattr(self, "headers", None)
+                if headers is None:
+                    return
+                content_length = int(headers.get("Content-Length", "0"))
+                if content_length > 0 and hasattr(self, "rfile"):
+                    self.rfile.read(min(content_length, MAX_REQUEST_BODY_BYTES))
+            except (ValueError, OSError, AttributeError):
+                pass
+
         def do_POST(self) -> None:  # noqa: N802 - required by BaseHTTPRequestHandler
             request_path = urlsplit(self.path).path
             if request_path == "/api/select":
@@ -120,6 +131,7 @@ def create_request_handler(
             if action is not None:
                 action()
                 return
+            self._drain_body()
             self._send_json(
                 HTTPStatus.NOT_FOUND,
                 {"error": "The requested resource was not found."},
@@ -510,6 +522,7 @@ def create_request_handler(
             except ValueError:
                 is_loopback = False
             if not is_loopback:
+                self._drain_body()
                 self._send_json(
                     HTTPStatus.FORBIDDEN,
                     {"error": "Administration is available only from this computer."},
@@ -517,6 +530,7 @@ def create_request_handler(
                 return False
             if admin_service is not None and analytics is not None:
                 return True
+            self._drain_body()
             self._send_json(
                 HTTPStatus.SERVICE_UNAVAILABLE,
                 {"error": "Administrative analytics are not configured."},
