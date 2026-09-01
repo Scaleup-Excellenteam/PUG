@@ -92,19 +92,20 @@ class AutocompleteSystem:
             return []
 
         # Phase 1: Fast O(L) scan and replace via Aho-Corasick DFA
-        normalized_query = self.error_cache.scan_and_replace(original_query)
+        search_query = self.error_cache.scan_and_replace(normalized_query)
+        cache_hit = search_query != normalized_query
 
         mode = self.ranking_mode if ranking_mode is None else ranking_mode
         if isinstance(self.index, SQLiteSubstringIndex) or type(self.index).__name__ == 'SuffixArrayIndex':
             text_scores = self.index.candidate_text_scores(
-                normalized_query,
+                search_query,
                 mode,
                 allow_popularity_exact_shortcut=(
                     mode is RankingMode.POPULARITY and not self._has_usage_counts
                 ),
             )
         else:
-            text_scores = self.index.candidate_text_scores(normalized_query, mode)
+            text_scores = self.index.candidate_text_scores(search_query, mode)
         ranked: list[tuple[int, int]] = []
         for sentence_id, text_score in text_scores.items():
             final_score = text_score
@@ -159,6 +160,31 @@ class AutocompleteSystem:
             ],
             duration_ms=round((time.perf_counter() - started) * 1000, 3),
         )
+
+        # Phase 2: Organic Learning (Asynchronous Write Path)
+        # If we didn't use the cache, but found a typo correction organically, submit it!
+        if not cache_hit and results:
+            best_id, best_data = results[0]
+            # A score < 2*len means we used a 1-edit penalty to find it
+            if best_data.score < 2 * len(normalized_query):
+                record_norm = self.master_array[best_id].normalized_text
+                # Find which 1-edit variant successfully matched
+                from autocomplete_system.scoring import generate_scored_variants
+
+                # Use a basic english alphabet for recovery
+                alphabet = "abcdefghijklmnopqrstuvwxyz0123456789 "
+                variants = generate_scored_variants(normalized_query, alphabet)
+
+                best_variant = None
+                best_variant_score = -1
+                for var, sc in variants.items():
+                    if sc > best_variant_score and var in record_norm:
+                        best_variant = var
+                        best_variant_score = sc
+
+                if best_variant:
+                    self.error_cache.submit_correction(normalized_query, best_variant)
+
         return results
 
     def get_best_k_completions(self, prefix: str) -> list[AutoCompleteData]:
