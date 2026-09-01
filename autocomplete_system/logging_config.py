@@ -8,6 +8,7 @@ import sys
 import threading
 import traceback
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from types import TracebackType
@@ -29,8 +30,8 @@ class JsonLineFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
         payload: dict[str, Any] = {
             "timestamp": datetime.fromtimestamp(
-                record.created, timezone.utc
-            ).isoformat(timespec="milliseconds"),
+                record.created, ZoneInfo("Asia/Jerusalem")
+            ).strftime("%Y/%m/%d, %H:%M"),
             "level": record.levelname,
             "logger": record.name,
             "event": getattr(record, "event", "log_message"),
