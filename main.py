@@ -205,7 +205,10 @@ def run_cli(
             )
             ranked = system.get_ranked_completions(effective_query)
             previous_top_sentence_id = ranked[0][0] if ranked else None
+            
+            print(f"Current query: '{current_input}'")
             if not ranked:
+                print(f"0 results found for '{effective_query}'.")
                 continue
 
             print(SUGGESTIONS_HEADER)
