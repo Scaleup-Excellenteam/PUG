@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 import csv
+import ctypes
 import io
 import json
+import logging
 import os
 import platform
+import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -15,22 +19,35 @@ import uuid
 from collections import Counter, defaultdict, deque
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
+from .build_metrics import read_build_metrics
 from .constants import (
     ALPHA,
     ANALYTICS_EVENTS_FILENAME,
     DEFAULT_INPUT_SOURCES,
     MAX_NODE_CACHE_SIZE,
+    RANKING_SETTINGS_FILENAME,
 )
 from .engine import AutocompleteSystem
+from .sqlite_store import SQLiteSentenceStore
+from .source_manifest import (
+    build_source_manifest,
+    discover_source_files,
+    manifests_match,
+    read_source_manifest,
+)
 from .logging_config import (
     DEFAULT_LOG_BACKUP_COUNT,
     DEFAULT_MAX_LOG_BYTES,
     SYSTEM_LOG_FILENAME,
+    log_event,
 )
 from .models import RankingMode
 from .storage import save_ranking_mode_setting
+
+
+LOGGER = logging.getLogger("autocomplete.analytics")
 
 
 def utc_now() -> str:
@@ -44,6 +61,69 @@ def _percentile(sorted_values: list[float], percentage: float) -> float:
         return 0.0
     index = int(round((len(sorted_values) - 1) * percentage))
     return round(sorted_values[index], 3)
+
+
+def _latency_summary(values: list[float]) -> dict[str, float | int]:
+    ordered = sorted(values)
+    recent = values[-100:]
+    return {
+        "sample_count": len(ordered),
+        "minimum": round(ordered[0], 3) if ordered else 0.0,
+        "average": round(sum(ordered) / len(ordered), 3) if ordered else 0.0,
+        "p50": _percentile(ordered, 0.50),
+        "p95": _percentile(ordered, 0.95),
+        "p99": _percentile(ordered, 0.99),
+        "maximum": round(ordered[-1], 3) if ordered else 0.0,
+        "total": round(sum(ordered), 3),
+        "recent_100_average": round(sum(recent) / len(recent), 3)
+        if recent
+        else 0.0,
+    }
+
+
+def _process_memory_bytes() -> int | None:
+    """Return this process's resident working set without optional packages."""
+
+    if os.name != "nt":
+        try:
+            import resource
+
+            resident = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+            return resident if sys.platform == "darwin" else resident * 1024
+        except (ImportError, OSError, ValueError):
+            return None
+
+    class ProcessMemoryCounters(ctypes.Structure):
+        _fields_ = [
+            ("cb", ctypes.c_ulong),
+            ("PageFaultCount", ctypes.c_ulong),
+            ("PeakWorkingSetSize", ctypes.c_size_t),
+            ("WorkingSetSize", ctypes.c_size_t),
+            ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+            ("QuotaPagedPoolUsage", ctypes.c_size_t),
+            ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+            ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+            ("PagefileUsage", ctypes.c_size_t),
+            ("PeakPagefileUsage", ctypes.c_size_t),
+        ]
+
+    counters = ProcessMemoryCounters()
+    counters.cb = ctypes.sizeof(counters)
+    try:
+        get_process = ctypes.windll.kernel32.GetCurrentProcess
+        get_memory = ctypes.windll.psapi.GetProcessMemoryInfo
+        get_process.restype = ctypes.c_void_p
+        get_memory.argtypes = (
+            ctypes.c_void_p,
+            ctypes.POINTER(ProcessMemoryCounters),
+            ctypes.c_ulong,
+        )
+        get_memory.restype = ctypes.c_int
+        if not get_memory(get_process(), ctypes.byref(counters), counters.cb):
+            return None
+    except (AttributeError, OSError):
+        return None
+    return int(counters.WorkingSetSize)
 
 
 class AnalyticsStore:
@@ -125,11 +205,15 @@ class AnalyticsStore:
         query_stats: dict[str, dict[str, float | int | str]] = {}
         selection_stats: dict[int, dict[str, object]] = {}
         latencies: list[float] = []
+        session_latencies: list[float] = []
         searches_by_hour: Counter[str] = Counter()
         recent = deque(maxlen=100)
         voice_searches = 0
         typed_searches = 0
         no_result_searches = 0
+        searches_last_hour = 0
+        searches_last_24_hours = 0
+        now = datetime.now(timezone.utc)
 
         for event in events:
             event_type = str(event.get("event_type", "unknown"))
@@ -146,9 +230,20 @@ class AnalyticsStore:
                     no_result_searches += 1
                 latency = float(event.get("duration_ms", 0.0))
                 latencies.append(latency)
+                if event.get("session_id") == self.session_id:
+                    session_latencies.append(latency)
                 timestamp = str(event.get("timestamp", ""))
                 if len(timestamp) >= 13:
                     searches_by_hour[timestamp[:13] + ":00"] += 1
+                try:
+                    event_time = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+                    if event_time.tzinfo is None:
+                        event_time = event_time.replace(tzinfo=timezone.utc)
+                    age_seconds = (now - event_time.astimezone(timezone.utc)).total_seconds()
+                    searches_last_hour += int(0 <= age_seconds <= 3600)
+                    searches_last_24_hours += int(0 <= age_seconds <= 86400)
+                except ValueError:
+                    pass
 
                 normalized_query = str(event.get("normalized_query", ""))
                 query = str(event.get("query", ""))
@@ -206,7 +301,6 @@ class AnalyticsStore:
             selection_stats.values(),
             key=lambda item: (-int(item["count"]), str(item["completed_sentence"])),
         )
-        latencies.sort()
         total_searches = type_counts["search"]
         return {
             "event_count": len(events),
@@ -225,17 +319,13 @@ class AnalyticsStore:
                 if total_searches
                 else 0.0,
                 "unique_normalized_queries": len(query_stats),
+                "last_hour": searches_last_hour,
+                "last_24_hours": searches_last_24_hours,
             },
             "selections": type_counts["selection"],
             "errors": type_counts["error"],
-            "performance_ms": {
-                "average": round(sum(latencies) / len(latencies), 3)
-                if latencies
-                else 0.0,
-                "p50": _percentile(latencies, 0.50),
-                "p95": _percentile(latencies, 0.95),
-                "maximum": round(latencies[-1], 3) if latencies else 0.0,
-            },
+            "performance_ms": _latency_summary(latencies),
+            "session_performance_ms": _latency_summary(session_latencies),
             "searches_by_hour": [
                 {"hour": hour, "count": count}
                 for hour, count in sorted(searches_by_hour.items())[-24:]
@@ -247,24 +337,45 @@ class AnalyticsStore:
 
 
 class RebuildManager:
-    """Launch one non-destructive replacement-index build at a time."""
+    """Build one replacement index at a time and optionally activate it."""
 
     def __init__(
         self,
         project_directory: Path,
-        source_path: Path,
+        source_path: Path | Iterable[Path],
         rebuild_parent: Path,
+        activation_callback: Callable[[Path], Path | None] | None = None,
+        active_data_directory: Path | None = None,
     ) -> None:
         self.project_directory = Path(project_directory).resolve()
-        self.source_path = Path(source_path).resolve()
+        if isinstance(source_path, Path):
+            raw_sources = (source_path,)
+        else:
+            raw_sources = tuple(source_path)
+        if not raw_sources:
+            raise ValueError("At least one index source is required.")
+        self.source_paths = tuple(Path(item).resolve() for item in raw_sources)
+        self.source_path = self.source_paths[0]
         self.rebuild_parent = Path(rebuild_parent).resolve()
+        self.activation_callback = activation_callback
+        self.active_data_directory = (
+            Path(active_data_directory).resolve()
+            if active_data_directory is not None
+            else None
+        )
         self._process: subprocess.Popen[str] | None = None
         self._log_file: io.TextIOWrapper | None = None
         self._target_directory: Path | None = None
         self._log_path: Path | None = None
         self._started_at: str | None = None
+        self._started_monotonic: float | None = None
         self._finished_at: str | None = None
+        self._finished_monotonic: float | None = None
         self._return_code: int | None = None
+        self._activated_at: str | None = None
+        self._backup_directory: Path | None = None
+        self._activation_error: str | None = None
+        self._unchanged_at: str | None = None
         self._lock = threading.RLock()
 
     def start(self) -> dict[str, object]:
@@ -272,8 +383,33 @@ class RebuildManager:
             self._refresh()
             if self._process is not None and self._process.poll() is None:
                 raise RuntimeError("A replacement-index build is already running.")
-            if not self.source_path.exists():
-                raise FileNotFoundError(f"Source input not found: {self.source_path}")
+            # ``source_path`` remains the backward-compatible mutable alias for
+            # the first configured source.
+            self.source_paths = (Path(self.source_path).resolve(),) + self.source_paths[1:]
+            for source in self.source_paths:
+                if not source.exists():
+                    raise FileNotFoundError(f"Source input not found: {source}")
+
+            if self.active_data_directory is not None:
+                previous_manifest = read_source_manifest(self.active_data_directory)
+                current_manifest = build_source_manifest(
+                    self.source_paths,
+                    previous=previous_manifest,
+                )
+                if manifests_match(previous_manifest, current_manifest):
+                    self._process = None
+                    self._target_directory = None
+                    self._log_path = None
+                    self._started_at = utc_now()
+                    self._started_monotonic = time.monotonic()
+                    self._finished_at = self._started_at
+                    self._finished_monotonic = self._started_monotonic
+                    self._return_code = 0
+                    self._activated_at = None
+                    self._backup_directory = None
+                    self._activation_error = None
+                    self._unchanged_at = self._started_at
+                    return self.status()
 
             stamp = datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6]
             self.rebuild_parent.mkdir(parents=True, exist_ok=True)
@@ -285,11 +421,11 @@ class RebuildManager:
                 str(self.project_directory / "build_index.py"),
                 "--backend",
                 "sqlite",
-                "--source",
-                str(self.source_path),
                 "--data-dir",
                 str(self._target_directory),
             ]
+            for source in self.source_paths:
+                command.extend(("--source", str(source)))
             creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
             self._process = subprocess.Popen(
                 command,
@@ -301,8 +437,14 @@ class RebuildManager:
                 creationflags=creation_flags,
             )
             self._started_at = utc_now()
+            self._started_monotonic = time.monotonic()
             self._finished_at = None
+            self._finished_monotonic = None
             self._return_code = None
+            self._activated_at = None
+            self._backup_directory = None
+            self._activation_error = None
+            self._unchanged_at = None
             return self.status()
 
     def _refresh(self) -> None:
@@ -311,19 +453,31 @@ class RebuildManager:
         return_code = self._process.poll()
         if return_code is not None and self._return_code is None:
             self._return_code = return_code
-            self._finished_at = utc_now()
             if self._log_file is not None:
                 self._log_file.close()
                 self._log_file = None
+            if return_code == 0 and self.activation_callback is not None:
+                assert self._target_directory is not None
+                try:
+                    self._backup_directory = self.activation_callback(
+                        self._target_directory
+                    )
+                    self._activated_at = utc_now()
+                except Exception as error:
+                    self._activation_error = f"{type(error).__name__}: {error}"
+            self._finished_at = utc_now()
+            self._finished_monotonic = time.monotonic()
 
     def status(self) -> dict[str, object]:
         with self._lock:
             self._refresh()
-            if self._process is None:
+            if self._unchanged_at is not None:
+                state = "unchanged"
+            elif self._process is None:
                 state = "idle"
             elif self._return_code is None:
                 state = "running"
-            elif self._return_code == 0:
+            elif self._return_code == 0 and self._activation_error is None:
                 state = "completed"
             else:
                 state = "failed"
@@ -336,13 +490,46 @@ class RebuildManager:
                     ).splitlines()[-12:]
                 except OSError:
                     log_tail = []
+            elapsed_seconds = (
+                round(
+                    (self._finished_monotonic or time.monotonic())
+                    - self._started_monotonic,
+                    3,
+                )
+                if self._started_monotonic is not None
+                else None
+            )
+            progress_sentences = None
+            progress_elapsed_seconds = None
+            for line in reversed(log_tail):
+                match = re.search(
+                    r"Read ([\d,]+) sentences \(([\d.]+)s elapsed\)", line
+                )
+                if match:
+                    progress_sentences = int(match.group(1).replace(",", ""))
+                    progress_elapsed_seconds = float(match.group(2))
+                    break
             return {
                 "state": state,
                 "pid": self._process.pid if self._process is not None else None,
                 "started_at": self._started_at,
                 "finished_at": self._finished_at,
+                "elapsed_seconds": elapsed_seconds,
+                "progress_sentences": progress_sentences,
+                "progress_sentences_per_second": round(
+                    progress_sentences / progress_elapsed_seconds, 2
+                )
+                if progress_sentences and progress_elapsed_seconds
+                else None,
                 "return_code": self._return_code,
+                "activated": self._activated_at is not None,
+                "activated_at": self._activated_at,
+                "backup_directory": str(self._backup_directory)
+                if self._backup_directory
+                else None,
+                "activation_error": self._activation_error,
                 "source_path": str(self.source_path),
+                "source_paths": [str(path) for path in self.source_paths],
                 "target_directory": str(self._target_directory)
                 if self._target_directory
                 else None,
@@ -361,18 +548,35 @@ class AdminService:
         project_directory: Path,
         started_monotonic: float | None = None,
         rebuild_manager: RebuildManager | None = None,
+        source_paths: Iterable[Path] | None = None,
+        backup_retention: int = 0,
     ) -> None:
         self.system = system
         self.analytics = analytics
         self.project_directory = Path(project_directory).resolve()
         self.started_monotonic = started_monotonic or time.monotonic()
         self.started_at = utc_now()
-        source = self.project_directory / DEFAULT_INPUT_SOURCES[0]
+        if backup_retention < 0:
+            raise ValueError("backup_retention cannot be negative.")
+        self.backup_retention = backup_retention
+        configured_sources = tuple(source_paths or DEFAULT_INPUT_SOURCES)
+        resolved_sources = tuple(
+            path.resolve()
+            if (path := Path(source)).is_absolute()
+            else (self.project_directory / path).resolve()
+            for source in configured_sources
+        )
         rebuild_parent = self.project_directory / "rebuilds"
+        configured_data = self.system.data_directory or Path("data")
+        active_data_directory = Path(configured_data)
+        if not active_data_directory.is_absolute():
+            active_data_directory = self.project_directory / active_data_directory
         self.rebuild_manager = rebuild_manager or RebuildManager(
             self.project_directory,
-            source,
+            resolved_sources,
             rebuild_parent,
+            activation_callback=self._activate_rebuild,
+            active_data_directory=active_data_directory,
         )
         self._static_corpus: dict[str, object] | None = None
         self._usage_by_id: dict[int, int] | None = None
@@ -380,9 +584,104 @@ class AdminService:
         self._static_lock = threading.Lock()
         self._usage_lock = threading.Lock()
 
+    def _prune_index_backups(self, rebuild_parent: Path) -> list[Path]:
+        backups = sorted(
+            (
+                path.resolve()
+                for path in rebuild_parent.glob("data-backup-*")
+                if path.is_dir()
+            ),
+            key=lambda path: path.name,
+            reverse=True,
+        )
+        removed = []
+        for path in backups[self.backup_retention :]:
+            if path.parent != rebuild_parent or not path.name.startswith("data-backup-"):
+                raise ValueError(f"Unsafe backup cleanup path: {path}")
+            shutil.rmtree(path)
+            removed.append(path)
+        return removed
+
+    def _activate_rebuild(self, target_directory: Path) -> Path | None:
+        """Promote a completed replacement index and reload it without restart."""
+
+        target_directory = Path(target_directory).resolve()
+        configured_data = self.system.data_directory or Path("data")
+        active_directory = Path(configured_data)
+        if not active_directory.is_absolute():
+            active_directory = self.project_directory / active_directory
+        active_directory = active_directory.resolve()
+        rebuild_parent = (self.project_directory / "rebuilds").resolve()
+        for path in (active_directory, target_directory, rebuild_parent):
+            if not path.is_relative_to(self.project_directory):
+                raise ValueError(f"Index activation path is outside the project: {path}")
+        if not active_directory.is_dir():
+            raise FileNotFoundError(
+                f"Active index directory not found: {active_directory}"
+            )
+        if not target_directory.is_dir():
+            raise FileNotFoundError(
+                f"Replacement index directory not found: {target_directory}"
+            )
+
+        suffix = target_directory.name.removeprefix("data-rebuild-")
+        backup_directory = rebuild_parent / f"data-backup-{suffix}"
+        if backup_directory.exists():
+            raise FileExistsError(
+                f"Index backup directory already exists: {backup_directory}"
+            )
+
+        for filename in (ANALYTICS_EVENTS_FILENAME, RANKING_SETTINGS_FILENAME):
+            source_file = active_directory / filename
+            if source_file.is_file():
+                shutil.copy2(source_file, target_directory / filename)
+
+        self.system.unload_index()
+        active_moved = False
+        replacement_moved = False
+        try:
+            active_directory.rename(backup_directory)
+            active_moved = True
+            target_directory.rename(active_directory)
+            replacement_moved = True
+            self.system.reload_index(active_directory)
+        except Exception:
+            self.system.unload_index()
+            if replacement_moved and active_directory.exists():
+                active_directory.rename(target_directory)
+            if active_moved and backup_directory.exists():
+                backup_directory.rename(active_directory)
+            if active_directory.is_dir():
+                self.system.reload_index(active_directory)
+            raise
+
+        with self._static_lock:
+            self._static_corpus = None
+        with self._usage_lock:
+            self._usage_by_id = None
+            self._usage_total = 0
+        self.analytics.record(
+            "index_activation",
+            active_directory=str(active_directory),
+            backup_directory=str(backup_directory),
+            sentence_count=len(self.system.master_array),
+            backend=type(self.system.index).__name__,
+        )
+        removed_backups = self._prune_index_backups(rebuild_parent)
+        log_event(
+            LOGGER,
+            "index_backups_pruned",
+            retained=self.backup_retention,
+            removed=[str(path) for path in removed_backups],
+        )
+        return backup_directory if backup_directory.exists() else None
+
     def _corpus_static(self) -> dict[str, object]:
         with self._static_lock:
             if self._static_corpus is not None:
+                return self._static_corpus
+            if isinstance(self.system.master_array, SQLiteSentenceStore):
+                self._static_corpus = self.system.master_array.corpus_statistics()
                 return self._static_corpus
             source_stats: dict[str, dict[str, int]] = defaultdict(
                 lambda: {"sentences": 0, "searchable": 0, "original_characters": 0}
@@ -426,11 +725,14 @@ class AdminService:
     def _popularity(self) -> dict[str, object]:
         with self._usage_lock:
             if self._usage_by_id is None:
-                self._usage_by_id = {
-                    sentence_id: record.usage_count
-                    for sentence_id, record in enumerate(self.system.master_array)
-                    if record.usage_count
-                }
+                if isinstance(self.system.master_array, SQLiteSentenceStore):
+                    self._usage_by_id = self.system.master_array.usage_counts()
+                else:
+                    self._usage_by_id = {
+                        sentence_id: record.usage_count
+                        for sentence_id, record in enumerate(self.system.master_array)
+                        if record.usage_count
+                    }
                 self._usage_total = sum(self._usage_by_id.values())
             usage_snapshot = dict(self._usage_by_id)
             total_usage = self._usage_total
@@ -469,34 +771,167 @@ class AdminService:
     def _storage(self) -> list[dict[str, object]]:
         data_directory = self.system.data_directory
         files: list[dict[str, object]] = []
-        locations = []
+        locations: list[tuple[str, str, Path, bool]] = []
         if data_directory is not None:
-            locations.append(("data", data_directory))
-        locations.append(("logs", self.project_directory / "logs"))
+            locations.append(("index", "data", Path(data_directory), False))
+        locations.append(("logs", "logs", self.project_directory / "logs", False))
+        locations.append(("packages", "dist", self.project_directory / "dist", False))
+        locations.append(("rebuilds", "rebuilds", self.project_directory / "rebuilds", True))
+        inactive = self.project_directory / "data_compact"
+        if inactive.exists():
+            locations.append(("inactive", "data_compact", inactive, True))
         seen: set[Path] = set()
-        for label, directory in locations:
+        for category, label, directory, recursive in locations:
             if not directory.exists():
                 continue
-            for path in sorted(item for item in directory.iterdir() if item.is_file()):
+            candidates = directory.rglob("*") if recursive else directory.iterdir()
+            for path in sorted(item for item in candidates if item.is_file()):
                 resolved = path.resolve()
                 if resolved in seen:
                     continue
                 seen.add(resolved)
                 stat = path.stat()
+                relative = path.relative_to(directory).as_posix()
                 files.append(
                     {
-                        "name": f"{label}/{path.name}",
+                        "name": f"{label}/{relative}",
+                        "category": category,
                         "bytes": stat.st_size,
                         "modified_at": datetime.fromtimestamp(
                             stat.st_mtime, timezone.utc
                         ).isoformat(timespec="seconds"),
                     }
                 )
+
+        try:
+            source_files = discover_source_files(self.rebuild_manager.source_paths)
+        except (FileNotFoundError, ValueError, OSError):
+            source_files = []
+        for key, path in source_files:
+            resolved = path.resolve()
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+            stat = path.stat()
+            files.append(
+                {
+                    "name": f"source/{key}",
+                    "category": "sources",
+                    "bytes": stat.st_size,
+                    "modified_at": datetime.fromtimestamp(
+                        stat.st_mtime, timezone.utc
+                    ).isoformat(timespec="seconds"),
+                }
+            )
         return files
+
+    def _technical_metrics(
+        self, storage: list[dict[str, object]], corpus: dict[str, object]
+    ) -> dict[str, object]:
+        category_bytes: Counter[str] = Counter()
+        category_files: Counter[str] = Counter()
+        for item in storage:
+            category = str(item.get("category", "other"))
+            category_bytes[category] += int(item.get("bytes", 0))
+            category_files[category] += 1
+
+        active_directory = Path(self.system.data_directory or self.project_directory / "data")
+        manifest = read_source_manifest(active_directory)
+        build = read_build_metrics(active_directory)
+        source_indexed_bytes = int((manifest or {}).get("total_bytes", 0))
+        source_current_bytes = int(category_bytes.get("sources", 0))
+        try:
+            current_source_snapshot = []
+            for key, path in discover_source_files(self.rebuild_manager.source_paths):
+                stat = path.stat()
+                current_source_snapshot.append(
+                    {"key": key, "size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
+                )
+        except (FileNotFoundError, ValueError, OSError):
+            current_source_snapshot = []
+        indexed_source_snapshot = [
+            {
+                "key": item.get("key"),
+                "size": item.get("size"),
+                "mtime_ns": item.get("mtime_ns"),
+            }
+            for item in (manifest or {}).get("files", [])
+            if isinstance(item, dict)
+        ]
+        source_changes_pending = current_source_snapshot != indexed_source_snapshot
+        package_bytes = int(category_bytes.get("packages", 0))
+        disk = shutil.disk_usage(active_directory if active_directory.exists() else self.project_directory)
+        sentence_count = int(corpus.get("total_sentences", 0))
+        index_bytes = int(category_bytes.get("index", 0))
+
+        if build is None:
+            build = {
+                "version": None,
+                "completed_at": None,
+                "backend": type(self.system.index).__name__,
+                "source_file_count": len((manifest or {}).get("files", [])),
+                "source_bytes": source_indexed_bytes,
+                "sentence_count": sentence_count,
+                "duration_seconds": None,
+                "sentences_per_second": None,
+                "input_mib_per_second": None,
+                "output_bytes": index_bytes,
+            }
+
+        package_file = max(
+            (item for item in storage if item.get("category") == "packages"),
+            key=lambda item: int(item.get("bytes", 0)),
+            default=None,
+        )
+        transfer_bytes = int(package_file.get("bytes", 0)) if package_file else 0
+        upload_estimates = [
+            {
+                "megabits_per_second": speed,
+                "seconds": round(transfer_bytes * 8 / (speed * 1_000_000), 1),
+            }
+            for speed in (10, 50, 100)
+        ] if transfer_bytes else []
+
+        return {
+            "runtime": {
+                "index_load_ms": self.system.index_load_duration_ms,
+                "process_memory_bytes": _process_memory_bytes(),
+            },
+            "storage": {
+                "tracked_total_bytes": sum(category_bytes.values()),
+                "categories": {
+                    category: {
+                        "bytes": category_bytes[category],
+                        "files": category_files[category],
+                    }
+                    for category in sorted(category_bytes)
+                },
+                "active_index_bytes": index_bytes,
+                "bytes_per_sentence": round(index_bytes / sentence_count, 2)
+                if sentence_count
+                else 0.0,
+                "source_current_bytes": source_current_bytes,
+                "source_indexed_bytes": source_indexed_bytes,
+                "source_changes_pending": source_changes_pending,
+                "disk_total_bytes": disk.total,
+                "disk_used_bytes": disk.used,
+                "disk_free_bytes": disk.free,
+            },
+            "last_build": build,
+            "upload": {
+                "package_name": package_file.get("name") if package_file else None,
+                "package_bytes": transfer_bytes,
+                "estimates": upload_estimates,
+                "note": "Calculated transfer time only; connection overhead is not measured.",
+            },
+        }
 
     def dashboard(self) -> dict[str, object]:
         corpus = dict(self._corpus_static())
         corpus["popularity"] = self._popularity()
+        storage = self._storage()
+        analytics_summary = self.analytics.summary()
+        technical = self._technical_metrics(storage, corpus)
         return {
             "generated_at": utc_now(),
             "server": {
@@ -516,6 +951,10 @@ class AdminService:
                 "data_directory": str(self.system.data_directory)
                 if self.system.data_directory
                 else None,
+                "index_sources": [
+                    str(path) for path in self.rebuild_manager.source_paths
+                ],
+                "index_backup_retention": self.backup_retention,
                 "analytics_file": str(self.analytics.path),
                 "system_log_file": str(
                     self.project_directory / "logs" / SYSTEM_LOG_FILENAME
@@ -524,8 +963,9 @@ class AdminService:
                 "system_log_backup_count": DEFAULT_LOG_BACKUP_COUNT,
             },
             "corpus": corpus,
-            "storage": self._storage(),
-            "analytics": self.analytics.summary(),
+            "storage": storage,
+            "technical": technical,
+            "analytics": analytics_summary,
             "rebuild": self.rebuild_manager.status(),
         }
 

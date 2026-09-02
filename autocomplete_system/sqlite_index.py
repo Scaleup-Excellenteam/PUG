@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import sqlite3
+import threading
 from collections import defaultdict
 from pathlib import Path
 
 from .constants import MAX_NODE_CACHE_SIZE, SQLITE_VARIANT_BATCH_SIZE
 from .models import RankingMode
+from .normalization import normalize_text
 from .scoring import generate_scored_variants, indel_penalty, substitution_penalty
 
 
@@ -19,8 +21,10 @@ class SQLiteSubstringIndex:
         "alphabet",
         "short_assignment_cache",
         "short_length_cache",
+        "compact_schema",
         "_database_path",
         "_connection",
+        "_query_lock",
     )
 
     def __init__(
@@ -29,13 +33,16 @@ class SQLiteSubstringIndex:
         alphabet: tuple[str, ...],
         short_assignment_cache: dict[str, list[int]],
         short_length_cache: dict[str, list[int]],
+        compact_schema: int | bool = 0,
     ) -> None:
         self.database_filename = database_filename
         self.alphabet = alphabet
         self.short_assignment_cache = short_assignment_cache
         self.short_length_cache = short_length_cache
+        self.compact_schema = int(compact_schema)
         self._database_path: Path | None = None
         self._connection: sqlite3.Connection | None = None
+        self._query_lock = threading.RLock()
 
     def attach(self, data_directory: Path) -> None:
         self.close()
@@ -45,10 +52,16 @@ class SQLiteSubstringIndex:
         if self._database_path is None:
             raise RuntimeError("The SQLite index is not attached to a data directory.")
         if self._connection is None:
-            self._connection = sqlite3.connect(self._database_path)
+            self._connection = sqlite3.connect(
+                self._database_path,
+                check_same_thread=False,
+            )
             self._connection.execute("PRAGMA query_only = ON")
             self._connection.execute("PRAGMA cache_size = -65536")
             self._connection.execute("PRAGMA mmap_size = 30000000000")
+            self._connection.create_function(
+                "normalize_text", 1, normalize_text, deterministic=True
+            )
         return self._connection
 
     def close(self) -> None:
@@ -56,36 +69,41 @@ class SQLiteSubstringIndex:
             self._connection.close()
             self._connection = None
 
-    def __getstate__(self) -> tuple[
-        str,
-        tuple[str, ...],
-        dict[str, list[int]],
-        dict[str, list[int]],
-    ]:
+    def __getstate__(self) -> tuple[object, ...]:
         return (
             self.database_filename,
             self.alphabet,
             self.short_assignment_cache,
             self.short_length_cache,
+            self.compact_schema,
         )
 
     def __setstate__(
         self,
-        state: tuple[
-            str,
-            tuple[str, ...],
-            dict[str, list[int]],
-            dict[str, list[int]],
-        ],
+        state: tuple[object, ...],
     ) -> None:
-        (
-            self.database_filename,
-            self.alphabet,
-            self.short_assignment_cache,
-            self.short_length_cache,
-        ) = state
+        if len(state) == 4:
+            # Backward compatibility with existing version-2 data directories.
+            database_filename, alphabet, assignment_cache, length_cache = state
+            compact_schema = False
+        elif len(state) == 5:
+            (
+                database_filename,
+                alphabet,
+                assignment_cache,
+                length_cache,
+                compact_schema,
+            ) = state
+        else:
+            raise ValueError("Unsupported SQLite index metadata state.")
+        self.database_filename = str(database_filename)
+        self.alphabet = tuple(alphabet)  # type: ignore[arg-type]
+        self.short_assignment_cache = dict(assignment_cache)  # type: ignore[arg-type]
+        self.short_length_cache = dict(length_cache)  # type: ignore[arg-type]
+        self.compact_schema = int(compact_schema)
         self._database_path = None
         self._connection = None
+        self._query_lock = threading.RLock()
 
     @staticmethod
     def _fts_expression(variants: list[str]) -> str:
@@ -105,17 +123,35 @@ class SQLiteSubstringIndex:
             if ranking_mode is RankingMode.ASSIGNMENT
             else "length_fts"
         )
-        sql = f"""
-            SELECT sentence_id
-            FROM {table}
-            WHERE {table} MATCH ?
-            ORDER BY rowid
-            LIMIT ?
-        """
-        rows = self._connect().execute(
-            sql,
-            (self._fts_expression(variants), MAX_NODE_CACHE_SIZE),
-        )
+        if self.compact_schema:
+            order_table = (
+                "assignment_order"
+                if ranking_mode is RankingMode.ASSIGNMENT
+                else "length_order"
+            )
+            sql = f"""
+                SELECT {order_table}.sentence_id
+                FROM {table}
+                JOIN {order_table} ON {order_table}.rowid = {table}.rowid
+                WHERE {table} MATCH ?
+                ORDER BY {table}.rowid
+                LIMIT ?
+            """
+        else:
+            sql = f"""
+                SELECT sentence_id
+                FROM {table}
+                WHERE {table} MATCH ?
+                ORDER BY rowid
+                LIMIT ?
+            """
+        with self._query_lock:
+            rows = list(
+                self._connect().execute(
+                    sql,
+                    (self._fts_expression(variants), MAX_NODE_CACHE_SIZE),
+                )
+            )
         return [int(row[0]) for row in rows]
 
     def _query_single_wildcard(
@@ -135,22 +171,92 @@ class SQLiteSubstringIndex:
             if ranking_mode is RankingMode.ASSIGNMENT
             else "length_fts"
         )
-        sql = f"""
-            SELECT sentence_id
-            FROM {table}
-            WHERE {table} MATCH ?
-              AND normalized GLOB ?
-            ORDER BY rowid
-            LIMIT ?
-        """
-        rows = self._connect().execute(
-            sql,
-            (
-                match_expression,
-                f"*{query_prefix}?{query_suffix}*",
-                MAX_NODE_CACHE_SIZE,
-            ),
-        )
+        if self.compact_schema:
+            order_table = (
+                "assignment_order"
+                if ranking_mode is RankingMode.ASSIGNMENT
+                else "length_order"
+            )
+            if self.compact_schema >= 2:
+                sql = f"""
+                    SELECT {table}.rowid, {order_table}.sentence_id,
+                           sentences.original
+                    FROM {table}
+                    JOIN {order_table}
+                      ON {order_table}.rowid = {table}.rowid
+                    JOIN sentences
+                      ON sentences.sentence_id = {order_table}.sentence_id
+                    WHERE {table} MATCH ?
+                      AND {table}.rowid > ?
+                    ORDER BY {table}.rowid
+                    LIMIT 512
+                """
+                matches: list[int] = []
+                last_rowid = 0
+                with self._query_lock:
+                    connection = self._connect()
+                    while len(matches) < MAX_NODE_CACHE_SIZE:
+                        rows = list(
+                            connection.execute(
+                                sql,
+                                (match_expression, last_rowid),
+                            )
+                        )
+                        if not rows:
+                            break
+                        for rowid, sentence_id, original in rows:
+                            normalized = normalize_text(str(original))
+                            start = 0
+                            while True:
+                                position = normalized.find(query_prefix, start)
+                                if position < 0:
+                                    break
+                                suffix_start = position + len(query_prefix) + 1
+                                if (
+                                    suffix_start <= len(normalized)
+                                    and normalized.startswith(query_suffix, suffix_start)
+                                ):
+                                    matches.append(int(sentence_id))
+                                    break
+                                start = position + 1
+                            if len(matches) >= MAX_NODE_CACHE_SIZE:
+                                break
+                        last_rowid = int(rows[-1][0])
+                return matches
+            normalized_expression = (
+                "sentences.normalized"
+            )
+            sql = f"""
+                SELECT {order_table}.sentence_id
+                FROM {table}
+                JOIN {order_table} ON {order_table}.rowid = {table}.rowid
+                JOIN sentences
+                  ON sentences.sentence_id = {order_table}.sentence_id
+                WHERE {table} MATCH ?
+                  AND {normalized_expression} GLOB ?
+                ORDER BY {table}.rowid
+                LIMIT ?
+            """
+        else:
+            sql = f"""
+                SELECT sentence_id
+                FROM {table}
+                WHERE {table} MATCH ?
+                  AND normalized GLOB ?
+                ORDER BY rowid
+                LIMIT ?
+            """
+        with self._query_lock:
+            rows = list(
+                self._connect().execute(
+                    sql,
+                    (
+                        match_expression,
+                        f"*{query_prefix}?{query_suffix}*",
+                        MAX_NODE_CACHE_SIZE,
+                    ),
+                )
+            )
         return [int(row[0]) for row in rows]
 
     @staticmethod

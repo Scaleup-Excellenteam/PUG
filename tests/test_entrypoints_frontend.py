@@ -18,6 +18,7 @@ import benchmark
 import build_index as build_index_cli
 import main as cli
 import web_app
+from autocomplete_system.build_metrics import read_build_metrics
 from autocomplete_system.engine import AutocompleteSystem
 from autocomplete_system.indexer import build_index
 from autocomplete_system.models import RankingMode
@@ -121,6 +122,11 @@ class EntrypointTests(unittest.TestCase):
                     build_index_cli.main()
 
                 index, master = load_index(data_directory)
+                metrics = read_build_metrics(data_directory)
+                self.assertIsNotNone(metrics)
+                assert metrics is not None
+                self.assertEqual(metrics["sentence_count"], len(master))
+                self.assertGreater(metrics["output_bytes"], 0)
                 loaded = AutocompleteSystem(index, master, data_directory)
                 try:
                     self.assertEqual(

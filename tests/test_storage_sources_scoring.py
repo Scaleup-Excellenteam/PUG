@@ -98,11 +98,32 @@ class SourceAndIndexerValidationTests(unittest.TestCase):
             archive.writestr("folder/", "")
             archive.writestr("a.TXT", "First\n")
             archive.writestr("ignored.md", "No\n")
+            archive.writestr("__MACOSX/._a.txt", b"\xff\xfe")
+            archive.writestr("folder/._z.txt", b"\xff\xfe")
 
         lines = list(iter_source_lines((archive_path,)))
         self.assertEqual(
             [(item.original_text, item.source_path) for item in lines],
             [("First", "a.TXT"), ("Last", "z.txt")],
+        )
+
+    def test_directory_reads_text_files_and_zip_archives_recursively(self) -> None:
+        corpus = self.root / "corpus"
+        nested = corpus / "nested"
+        nested.mkdir(parents=True)
+        (corpus / "plain.txt").write_text("Plain\n", encoding="utf-8")
+        with zipfile.ZipFile(nested / "extra.zip", "w") as archive:
+            archive.writestr("inside.txt", "Archived\n")
+            archive.writestr("ignored.csv", "Not indexed\n")
+
+        lines = list(iter_source_lines((corpus,)))
+
+        self.assertEqual(
+            [(item.original_text, item.source_path) for item in lines],
+            [
+                ("Archived", "nested/extra.zip!/inside.txt"),
+                ("Plain", "plain.txt"),
+            ],
         )
 
     def test_missing_and_unsupported_sources_are_rejected(self) -> None:

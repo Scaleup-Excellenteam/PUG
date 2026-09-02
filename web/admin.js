@@ -20,8 +20,8 @@ const actionDefinitions = {
     phrase: "RESET POPULARITY",
   },
   "rebuild-index": {
-    title: "Build a replacement index?",
-    description: "This starts a resource-intensive build from Archive.zip in a separate folder. The active index remains untouched.",
+    title: "Build and activate a new index?",
+    description: "This manual action builds from every TXT and ZIP file under Archive. File changes never start a build by themselves. After this confirmed build succeeds, the new index replaces the active index.",
     phrase: "REBUILD INDEX",
   },
 };
@@ -30,6 +30,15 @@ const byId = (id) => document.getElementById(id);
 const number = (value) => new Intl.NumberFormat("en-US").format(value || 0);
 const date = (value) => value ? new Intl.DateTimeFormat("en-US", { dateStyle: "medium", timeStyle: "medium" }).format(new Date(value)) : "—";
 const duration = (value) => `${Number(value || 0).toFixed(2)} ms`;
+const optionalDuration = (value) => value == null ? "Not measured" : duration(value);
+const elapsed = (value) => {
+  if (value == null) return "Not measured";
+  const seconds = Math.max(0, Number(value));
+  if (seconds < 60) return `${seconds.toFixed(1)} sec`;
+  const minutes = Math.floor(seconds / 60); const rest = Math.round(seconds % 60);
+  if (minutes < 60) return `${minutes}m ${rest}s`;
+  const hours = Math.floor(minutes / 60); return `${hours}h ${minutes % 60}m`;
+};
 const bytes = (value) => {
   const units = ["B", "KB", "MB", "GB", "TB"];
   let amount = Number(value || 0);
@@ -76,6 +85,59 @@ function renderMetrics(data) {
   byId("metric-typed").textContent = `${number(searches.typed)} typed searches`;
 }
 
+function definitionRows(values) {
+  return values.map(([termText, descriptionText]) => {
+    const row = document.createElement("div"); const term = document.createElement("dt"); const description = document.createElement("dd");
+    term.textContent = termText; description.textContent = descriptionText; row.append(term, description); return row;
+  });
+}
+
+function renderTechnical(data) {
+  const technical = data.technical; const storage = technical.storage; const build = technical.last_build;
+  const performance = data.analytics.performance_ms; const sessionPerformance = data.analytics.session_performance_ms; const upload = technical.upload;
+  byId("metric-index-size").textContent = bytes(storage.active_index_bytes);
+  byId("metric-bytes-sentence").textContent = `${number(storage.bytes_per_sentence)} bytes per sentence`;
+  byId("metric-memory").textContent = technical.runtime.process_memory_bytes == null ? "Unavailable" : bytes(technical.runtime.process_memory_bytes);
+  byId("metric-load-time").textContent = optionalDuration(technical.runtime.index_load_ms);
+  byId("metric-build-time").textContent = elapsed(build.duration_seconds);
+  byId("metric-build-rate").textContent = build.sentences_per_second == null ? "Recorded after the next full build" : `${number(build.sentences_per_second)} sentences/sec`;
+  byId("metric-source-size").textContent = bytes(storage.source_current_bytes);
+  byId("metric-source-state").textContent = storage.source_changes_pending ? "Source files changed; manual rebuild available" : "Sources match the active index manifest";
+  byId("metric-package-size").textContent = upload.package_bytes ? bytes(upload.package_bytes) : "Not found";
+  const commonEstimate = upload.estimates.find((item) => item.megabits_per_second === 50);
+  byId("metric-package-time").textContent = commonEstimate ? `${elapsed(commonEstimate.seconds)} at 50 Mbps (estimate)` : "No ZIP package found";
+
+  byId("latency-samples").textContent = `${number(performance.sample_count)} measured searches`;
+  const latencyRow = (scope, metrics) => {
+    const row = document.createElement("tr");
+    row.append(textCell(scope), ...[metrics.minimum, metrics.p50, metrics.average, metrics.p95, metrics.p99, metrics.maximum, metrics.recent_100_average].map((value) => textCell(duration(value))));
+    return row;
+  };
+  byId("latency-metrics").replaceChildren(latencyRow("Current server session", sessionPerformance), latencyRow("All recorded history", performance));
+
+  byId("build-metrics").replaceChildren(...definitionRows([
+    ["Completed", build.completed_at ? date(build.completed_at) : "Not recorded for this index"],
+    ["Backend", build.backend || data.configuration.index_backend],
+    ["Duration", elapsed(build.duration_seconds)],
+    ["Sentences", number(build.sentence_count)],
+    ["Rate", build.sentences_per_second == null ? "Not measured" : `${number(build.sentences_per_second)} sentences/sec`],
+    ["Input throughput", build.input_mib_per_second == null ? "Not measured" : `${Number(build.input_mib_per_second).toFixed(2)} MiB/sec`],
+    ["Source files", number(build.source_file_count)],
+    ["Input size", bytes(build.source_bytes)],
+    ["Output size", bytes(build.output_bytes)],
+  ]));
+
+  const categoryRows = Object.entries(storage.categories).map(([category, details]) => {
+    const row = document.createElement("tr"); row.append(textCell(category), textCell(number(details.files)), textCell(bytes(details.bytes))); return row;
+  });
+  replaceTable("storage-categories", categoryRows, 3, "No tracked storage");
+  byId("tracked-storage").textContent = `${bytes(storage.tracked_total_bytes)} tracked · ${bytes(storage.disk_free_bytes)} disk free`;
+  const estimateRows = upload.estimates.map((item) => {
+    const row = document.createElement("tr"); row.append(textCell(`${item.megabits_per_second} Mbps`), textCell(elapsed(item.seconds))); return row;
+  });
+  replaceTable("upload-estimates", estimateRows, 2, "Create a ZIP package to calculate upload estimates");
+}
+
 function renderActivity(items) {
   const chart = byId("activity-chart");
   if (!items.length) {
@@ -102,10 +164,7 @@ function renderSystem(data) {
     ["Alpha", data.configuration.alpha], ["Node cache", data.configuration.max_node_cache_size],
     ["Python", data.server.python_version], ["Process", data.server.process_id],
   ];
-  byId("system-health").replaceChildren(...values.map(([term, description]) => {
-    const row = document.createElement("div"); const dt = document.createElement("dt"); const dd = document.createElement("dd");
-    dt.textContent = term; dd.textContent = description; row.append(dt, dd); return row;
-  }));
+  byId("system-health").replaceChildren(...definitionRows(values));
 }
 
 function renderTopQueries(items) {
@@ -152,8 +211,8 @@ function renderSources(items) {
 
 function renderStorage(items) {
   replaceTable("storage-files", items.map((item) => {
-    const row = document.createElement("tr"); row.append(textCell(item.name), textCell(bytes(item.bytes)), textCell(date(item.modified_at), "cell-muted")); return row;
-  }), 3);
+    const row = document.createElement("tr"); row.append(textCell(item.name), textCell(item.category), textCell(bytes(item.bytes)), textCell(date(item.modified_at), "cell-muted")); return row;
+  }), 4);
 }
 
 function eventDetails(event) {
@@ -246,7 +305,17 @@ function scheduleLogFilter() {
 
 function renderRebuild(rebuild) {
   byId("rebuild-state").textContent = rebuild.state[0].toUpperCase() + rebuild.state.slice(1);
-  byId("rebuild-target").textContent = rebuild.target_directory || "No replacement build has been started.";
+  const progress = rebuild.progress_sentences
+    ? ` · ${number(rebuild.progress_sentences)} sentences · ${number(rebuild.progress_sentences_per_second)} sentences/sec`
+    : "";
+  const timing = rebuild.elapsed_seconds == null ? "" : ` · ${elapsed(rebuild.elapsed_seconds)} elapsed${progress}`;
+  if (rebuild.activated) {
+    byId("rebuild-target").textContent = `New index active${timing}. Previous index backup: ${rebuild.backup_directory || "pruned by retention policy"}`;
+  } else if (rebuild.activation_error) {
+    byId("rebuild-target").textContent = `Activation failed: ${rebuild.activation_error}`;
+  } else {
+    byId("rebuild-target").textContent = rebuild.target_directory ? `${rebuild.target_directory}${timing}` : `No replacement build has been started${timing}.`;
+  }
   const log = byId("rebuild-log");
   log.hidden = !rebuild.log_tail.length; log.textContent = rebuild.log_tail.join("\n");
   document.querySelector('[data-action="rebuild-index"]').disabled = rebuild.state === "running";
@@ -275,6 +344,7 @@ async function loadDashboard(showStatus = false) {
     if (!response.ok) throw new Error("Dashboard data could not be loaded");
     const data = await response.json(); state.dashboard = data;
     renderMetrics(data); renderActivity(data.analytics.searches_by_hour); renderSystem(data);
+    renderTechnical(data);
     renderPopularityControl(data.configuration.popularity_enabled);
     renderTopQueries(data.analytics.top_queries); renderPopularity(data.corpus.popularity.top_sentences, data.configuration.alpha, data.configuration.popularity_enabled);
     renderSources(data.corpus.sources); renderStorage(data.storage);

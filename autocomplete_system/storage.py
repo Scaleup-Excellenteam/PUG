@@ -19,10 +19,12 @@ from .constants import (
 from .models import RankingMode, SentenceRecord
 from .logging_config import log_event
 from .sqlite_index import SQLiteSubstringIndex
+from .sqlite_store import SQLiteSentenceStore
 from .trie import CompressedSuffixTrie
 from .suffix_array import SuffixArrayIndex
 
 SearchIndex: TypeAlias = CompressedSuffixTrie | SQLiteSubstringIndex | SuffixArrayIndex
+MasterArray: TypeAlias = list[SentenceRecord] | SQLiteSentenceStore
 LOGGER = logging.getLogger("autocomplete.storage")
 
 
@@ -42,9 +44,9 @@ def _atomic_write_text(path: Path, data: str) -> None:
 def save_index(
     data_directory: Path,
     index: SearchIndex,
-    master_array: list[SentenceRecord],
+    master_array: MasterArray,
 ) -> None:
-    """Serialize index metadata, the master array, and current usage counts."""
+    """Persist index metadata, sentence storage, and current usage counts."""
 
     started = time.perf_counter()
     log_event(
@@ -65,7 +67,17 @@ def save_index(
         data_directory / INDEX_FILENAME,
         {"version": INDEX_VERSION, "index": index},
     )
-    _atomic_pickle_dump(data_directory / MASTER_ARRAY_FILENAME, master_array)
+    master_path = data_directory / MASTER_ARRAY_FILENAME
+    if isinstance(index, SQLiteSubstringIndex) and index.compact_schema:
+        # Sentence rows are already stored once in SQLite.  Keep only a tiny
+        # compatibility manifest at the historical filename instead of a
+        # multi-gigabyte duplicate of the corpus.
+        _atomic_pickle_dump(
+            master_path,
+            {"storage": "sqlite", "sentence_count": len(master_array)},
+        )
+    else:
+        _atomic_pickle_dump(master_path, master_array)
     save_usage_stats(data_directory, master_array)
     log_event(
         LOGGER,
@@ -77,23 +89,20 @@ def save_index(
     )
 
 
-def load_index(data_directory: Path) -> tuple[SearchIndex, list[SentenceRecord]]:
+def load_index(data_directory: Path) -> tuple[SearchIndex, MasterArray]:
     """Load and validate the serialized search index and master sentence array."""
 
     started = time.perf_counter()
     log_event(LOGGER, "index_load_started", data_directory=str(data_directory))
     index_path = data_directory / INDEX_FILENAME
     master_path = data_directory / MASTER_ARRAY_FILENAME
-    if not index_path.is_file() or not master_path.is_file():
+    if not index_path.is_file():
         raise FileNotFoundError(
             "Autocomplete index not found. Run build_index.py before starting the CLI."
         )
 
     with index_path.open("rb") as index_file:
         envelope: Any = pickle.load(index_file)
-    with master_path.open("rb") as master_file:
-        master_array: Any = pickle.load(master_file)
-
     if (
         not isinstance(envelope, dict)
         or envelope.get("version") != INDEX_VERSION
@@ -104,17 +113,34 @@ def load_index(data_directory: Path) -> tuple[SearchIndex, list[SentenceRecord]]
         raise ValueError(
             "The serialized autocomplete index is invalid or has an unsupported version."
         )
-    if not isinstance(master_array, list) or not all(
-        isinstance(record, SentenceRecord) for record in master_array
-    ):
-        raise ValueError("The serialized master array is invalid.")
-
     index = envelope["index"]
     if isinstance(index, SQLiteSubstringIndex):
         database_path = data_directory / index.database_filename
         if not database_path.is_file():
             raise FileNotFoundError(f"SQLite search database not found: {database_path}")
         index.attach(data_directory)
+        if index.compact_schema:
+            master_array: MasterArray = SQLiteSentenceStore(database_path)
+        else:
+            if not master_path.is_file():
+                raise FileNotFoundError(
+                    "Autocomplete index not found. Run build_index.py before starting the CLI."
+                )
+            with master_path.open("rb") as master_file:
+                master_array = pickle.load(master_file)
+    else:
+        if not master_path.is_file():
+            raise FileNotFoundError(
+                "Autocomplete index not found. Run build_index.py before starting the CLI."
+            )
+        with master_path.open("rb") as master_file:
+            master_array = pickle.load(master_file)
+
+    if not isinstance(master_array, (list, SQLiteSentenceStore)) or (
+        isinstance(master_array, list)
+        and not all(isinstance(record, SentenceRecord) for record in master_array)
+    ):
+        raise ValueError("The serialized master array is invalid.")
 
     load_usage_stats(data_directory, master_array)
     log_event(
@@ -130,12 +156,15 @@ def load_index(data_directory: Path) -> tuple[SearchIndex, list[SentenceRecord]]
 
 def load_usage_stats(
     data_directory: Path,
-    master_array: list[SentenceRecord],
+    master_array: MasterArray,
 ) -> None:
     """Reset and apply persisted non-negative usage counts."""
 
-    for record in master_array:
-        record.usage_count = 0
+    if isinstance(master_array, SQLiteSentenceStore):
+        master_array.reset_usage_counts()
+    else:
+        for record in master_array:
+            record.usage_count = 0
 
     stats_path = data_directory / USAGE_STATS_FILENAME
     if not stats_path.exists():
@@ -145,6 +174,7 @@ def load_usage_stats(
     if not isinstance(raw_stats, dict):
         raise ValueError("usage_stats.json must contain a JSON object.")
 
+    validated_stats: dict[int, int] = {}
     for raw_sentence_id, raw_count in raw_stats.items():
         try:
             sentence_id = int(raw_sentence_id)
@@ -160,7 +190,12 @@ def load_usage_stats(
             or raw_count < 0
         ):
             raise ValueError(f"Invalid usage-stat entry for sentence ID {raw_sentence_id}.")
-        master_array[sentence_id].usage_count = raw_count
+        validated_stats[sentence_id] = raw_count
+    if isinstance(master_array, SQLiteSentenceStore):
+        master_array.replace_usage_counts(validated_stats)
+    else:
+        for sentence_id, count in validated_stats.items():
+            master_array[sentence_id].usage_count = count
     log_event(
         LOGGER,
         "usage_stats_loaded",
@@ -171,16 +206,22 @@ def load_usage_stats(
 
 def save_usage_stats(
     data_directory: Path,
-    master_array: list[SentenceRecord],
+    master_array: MasterArray,
 ) -> None:
     """Persist nonzero usage counts; omitted IDs implicitly have count zero."""
 
     data_directory.mkdir(parents=True, exist_ok=True)
-    stats = {
-        str(sentence_id): record.usage_count
-        for sentence_id, record in enumerate(master_array)
-        if record.usage_count
-    }
+    if isinstance(master_array, SQLiteSentenceStore):
+        stats = {
+            str(sentence_id): count
+            for sentence_id, count in master_array.usage_counts().items()
+        }
+    else:
+        stats = {
+            str(sentence_id): record.usage_count
+            for sentence_id, record in enumerate(master_array)
+            if record.usage_count
+        }
     serialized = json.dumps(stats, ensure_ascii=False, separators=(",", ":"))
     _atomic_write_text(data_directory / USAGE_STATS_FILENAME, serialized)
     log_event(

@@ -9,12 +9,18 @@ from bisect import bisect_left
 from collections.abc import Callable, Sequence
 from pathlib import Path
 
-from .constants import MAX_NODE_CACHE_SIZE, SQLITE_INDEX_FILENAME
+from .constants import (
+    MAX_NODE_CACHE_SIZE,
+    SQLITE_BUILD_CACHE_MIB,
+    SQLITE_INDEX_FILENAME,
+    SQLITE_INSERT_BATCH_SIZE,
+)
 from .models import SentenceRecord
 from .logging_config import log_event
 from .normalization import normalize_text
 from .sources import iter_source_lines
 from .sqlite_index import SQLiteSubstringIndex
+from .sqlite_store import SQLiteSentenceStore
 from .trie import CompressedSuffixTrie
 
 ProgressCallback = Callable[[int], None]
@@ -149,35 +155,164 @@ def _cache_ranked_id(
 def _create_sqlite_schema(connection: sqlite3.Connection) -> None:
     connection.executescript(
         """
+        CREATE TABLE metadata (
+            key TEXT PRIMARY KEY,
+            value INTEGER NOT NULL
+        ) WITHOUT ROWID;
+        CREATE TABLE sources (
+            source_id INTEGER PRIMARY KEY,
+            source_path TEXT NOT NULL UNIQUE
+        );
+        CREATE TABLE source_statistics (
+            source_id INTEGER PRIMARY KEY,
+            sentence_count INTEGER NOT NULL,
+            searchable_count INTEGER NOT NULL,
+            original_characters INTEGER NOT NULL
+        );
         CREATE TABLE sentences (
             sentence_id INTEGER PRIMARY KEY,
-            normalized TEXT NOT NULL,
             original TEXT NOT NULL,
-            source_path TEXT NOT NULL,
+            source_id INTEGER NOT NULL,
             line_number INTEGER NOT NULL,
-            original_length INTEGER NOT NULL
+            original_length INTEGER NOT NULL,
+            searchable INTEGER NOT NULL,
+            FOREIGN KEY (source_id) REFERENCES sources(source_id)
         );
+        CREATE TABLE assignment_order (sentence_id INTEGER NOT NULL);
+        CREATE TABLE length_order (sentence_id INTEGER NOT NULL);
         CREATE VIRTUAL TABLE assignment_fts USING fts5(
             normalized,
-            sentence_id UNINDEXED,
+            content='',
+            columnsize=0,
             tokenize='trigram'
         );
         CREATE VIRTUAL TABLE length_fts USING fts5(
             normalized,
-            sentence_id UNINDEXED,
+            content='',
+            columnsize=0,
             tokenize='trigram'
         );
+        CREATE TEMP TABLE normalized_build (
+            sentence_id INTEGER PRIMARY KEY,
+            normalized TEXT NOT NULL
+        ) WITHOUT ROWID;
         """
     )
+
+
+def _populate_sqlite_search_data(
+    connection: sqlite3.Connection,
+    sentence_count: int,
+    normalized_relation: str = "temp.normalized_build",
+) -> None:
+    """Build both immutable rank orders and their contentless FTS indexes."""
+
+    if normalized_relation not in {"temp.normalized_build", "legacy.sentences"}:
+        raise ValueError("Unsupported normalized-text build relation.")
+    metadata = (
+            ("sentence_count", sentence_count),
+            (
+                "searchable_sentences",
+                connection.execute(
+                    "SELECT COUNT(*) FROM sentences WHERE searchable"
+                ).fetchone()[0],
+            ),
+            (
+                "original_characters",
+                connection.execute(
+                    "SELECT COALESCE(SUM(original_length), 0) FROM sentences"
+                ).fetchone()[0],
+            ),
+            (
+                "normalized_characters",
+                connection.execute(
+                    f"SELECT COALESCE(SUM(LENGTH(normalized)), 0) FROM {normalized_relation}"
+                ).fetchone()[0],
+            ),
+            (
+                "longest_original_length",
+                connection.execute(
+                    "SELECT COALESCE(MAX(original_length), 0) FROM sentences"
+                ).fetchone()[0],
+            ),
+        )
+    for item in metadata:
+        connection.execute(
+            "INSERT INTO metadata(key, value) VALUES (?, ?)",
+            item,
+        )
+    connection.execute(
+        """
+        INSERT INTO source_statistics(
+            source_id, sentence_count, searchable_count, original_characters
+        )
+        SELECT source_id, COUNT(*), SUM(searchable), SUM(original_length)
+        FROM sentences
+        GROUP BY source_id
+        """
+    )
+    connection.execute(
+        f"""
+        INSERT INTO assignment_order(sentence_id)
+        SELECT sentences.sentence_id
+        FROM sentences
+        JOIN sources ON sources.source_id = sentences.source_id
+        JOIN {normalized_relation} AS normalized_rows
+          ON normalized_rows.sentence_id = sentences.sentence_id
+        WHERE sentences.searchable
+        ORDER BY normalized_rows.normalized, sentences.original,
+                 sources.source_path, sentences.line_number,
+                 sentences.sentence_id
+        """
+    )
+    connection.execute(
+        f"""
+        INSERT INTO assignment_fts(rowid, normalized)
+        SELECT assignment_order.rowid, normalized_rows.normalized
+        FROM assignment_order
+        JOIN {normalized_relation} AS normalized_rows
+          ON normalized_rows.sentence_id = assignment_order.sentence_id
+        ORDER BY assignment_order.rowid
+        """
+    )
+    connection.execute("INSERT INTO assignment_fts(assignment_fts) VALUES('optimize')")
+    connection.execute(
+        """
+        INSERT INTO length_order(sentence_id)
+        SELECT sentence_id
+        FROM sentences
+        WHERE searchable
+        ORDER BY original_length, original, sentence_id
+        """
+    )
+    connection.execute(
+        f"""
+        INSERT INTO length_fts(rowid, normalized)
+        SELECT length_order.rowid, normalized_rows.normalized
+        FROM length_order
+        JOIN {normalized_relation} AS normalized_rows
+          ON normalized_rows.sentence_id = length_order.sentence_id
+        ORDER BY length_order.rowid
+        """
+    )
+    connection.execute("INSERT INTO length_fts(length_fts) VALUES('optimize')")
+    connection.commit()
 
 
 def build_sqlite_index(
     sources: InputSources,
     data_directory: Path,
     progress_callback: ProgressCallback | None = None,
-) -> tuple[SQLiteSubstringIndex, list[SentenceRecord]]:
+    *,
+    insert_batch_size: int = SQLITE_INSERT_BATCH_SIZE,
+    cache_mib: int = SQLITE_BUILD_CACHE_MIB,
+) -> tuple[SQLiteSubstringIndex, SQLiteSentenceStore]:
     """Build the scalable disk-backed substring index atomically."""
 
+    if insert_batch_size <= 0:
+        raise ValueError("insert_batch_size must be positive.")
+    if cache_mib <= 0:
+        raise ValueError("cache_mib must be positive.")
     started = time.perf_counter()
     resolved_sources = _coerce_sources(sources)
     log_event(
@@ -192,7 +327,8 @@ def build_sqlite_index(
     if temporary_path.exists():
         temporary_path.unlink()
 
-    master_array: list[SentenceRecord] = []
+    sentence_count = 0
+    source_ids: dict[str, int] = {}
     alphabet: set[str] = set()
     ranked_assignment_cache: dict[
         str, list[tuple[tuple[object, ...], int]]
@@ -205,28 +341,31 @@ def build_sqlite_index(
         connection.execute("PRAGMA journal_mode = OFF")
         connection.execute("PRAGMA synchronous = OFF")
         connection.execute("PRAGMA temp_store = FILE")
-        connection.execute("PRAGMA cache_size = -262144")
+        connection.execute(f"PRAGMA cache_size = -{cache_mib * 1024}")
+        connection.execute("PRAGMA locking_mode = EXCLUSIVE")
         _create_sqlite_schema(connection)
 
         insert_sql = """
             INSERT INTO sentences (
-                sentence_id, normalized, original, source_path,
-                line_number, original_length
+                sentence_id, original, source_id,
+                line_number, original_length, searchable
             ) VALUES (?, ?, ?, ?, ?, ?)
         """
         pending_rows: list[tuple[object, ...]] = []
+        pending_normalized: list[tuple[int, str]] = []
 
         for source_line in iter_source_lines(resolved_sources):
             normalized = normalize_text(source_line.original_text)
-            sentence_id = len(master_array)
-            master_array.append(
-                SentenceRecord(
-                    original_text=source_line.original_text,
-                    normalized_text=normalized,
-                    source_path=source_line.source_path,
-                    line_number=source_line.line_number,
+            sentence_id = sentence_count
+            sentence_count += 1
+            source_id = source_ids.get(source_line.source_path)
+            if source_id is None:
+                source_id = len(source_ids)
+                source_ids[source_line.source_path] = source_id
+                connection.execute(
+                    "INSERT INTO sources(source_id, source_path) VALUES (?, ?)",
+                    (source_id, source_line.source_path),
                 )
-            )
             assignment_key = (
                 normalized,
                 source_line.original_text,
@@ -242,13 +381,14 @@ def build_sqlite_index(
             pending_rows.append(
                 (
                     sentence_id,
-                    normalized,
                     source_line.original_text,
-                    source_line.source_path,
+                    source_id,
                     source_line.line_number,
                     len(source_line.original_text),
+                    int(bool(normalized)),
                 )
             )
+            pending_normalized.append((sentence_id, normalized))
 
             if normalized:
                 alphabet.update(normalized)
@@ -271,10 +411,15 @@ def build_sqlite_index(
                         length_key,
                     )
 
-            if len(pending_rows) >= 10_000:
+            if len(pending_rows) >= insert_batch_size:
                 connection.executemany(insert_sql, pending_rows)
+                connection.executemany(
+                    "INSERT INTO temp.normalized_build VALUES (?, ?)",
+                    pending_normalized,
+                )
                 connection.commit()
                 pending_rows.clear()
+                pending_normalized.clear()
             if progress_callback is not None and (sentence_id + 1) % 100_000 == 0:
                 progress_callback(sentence_id + 1)
             if (sentence_id + 1) % 100_000 == 0:
@@ -287,31 +432,13 @@ def build_sqlite_index(
 
         if pending_rows:
             connection.executemany(insert_sql, pending_rows)
+            connection.executemany(
+                "INSERT INTO temp.normalized_build VALUES (?, ?)",
+                pending_normalized,
+            )
             connection.commit()
 
-        connection.execute(
-            """
-            INSERT INTO assignment_fts(normalized, sentence_id)
-            SELECT normalized, sentence_id
-            FROM sentences
-            WHERE normalized <> ''
-            ORDER BY normalized, original, source_path, line_number, sentence_id
-            """
-        )
-        connection.execute(
-            "INSERT INTO assignment_fts(assignment_fts) VALUES('optimize')"
-        )
-        connection.execute(
-            """
-            INSERT INTO length_fts(normalized, sentence_id)
-            SELECT normalized, sentence_id
-            FROM sentences
-            WHERE normalized <> ''
-            ORDER BY original_length, original, sentence_id
-            """
-        )
-        connection.execute("INSERT INTO length_fts(length_fts) VALUES('optimize')")
-        connection.commit()
+        _populate_sqlite_search_data(connection, sentence_count)
         connection.close()
         connection = None
         temporary_path.replace(database_path)
@@ -335,14 +462,20 @@ def build_sqlite_index(
         alphabet=tuple(sorted(alphabet)),
         short_assignment_cache=short_assignment_cache,
         short_length_cache=short_length_cache,
+        compact_schema=2,
     )
     index.attach(data_directory)
+    master_array = SQLiteSentenceStore(
+        database_path,
+        sentence_count=sentence_count,
+        schema_version=2,
+    )
     log_event(
         LOGGER,
         "sqlite_index_build_completed",
         sources=[str(source) for source in resolved_sources],
         data_directory=str(data_directory),
-        sentence_count=len(master_array),
+        sentence_count=sentence_count,
         alphabet_size=len(alphabet),
         duration_seconds=round(time.perf_counter() - started, 3),
     )

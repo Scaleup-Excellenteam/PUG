@@ -8,34 +8,82 @@ standard library.
 
 ## Architecture
 
-- `SentenceRecord` master array: original and normalized text, relative source
+- `SentenceRecord` master sequence: original and normalized text, relative source
   path, 1-based source line, and independent `usage_count` for every input line.
+  SQLite builds expose this sequence lazily instead of duplicating the complete
+  corpus in a multi-gigabyte pickle.
 - Literal backend: a path-compressed all-character suffix Trie whose nodes use
   `__slots__` and cache only sentence IDs. It performs DFS with an edit budget
   of at most one and is intended for small/medium corpora and structural tests.
-- Scalable backend: a disk-backed SQLite FTS5 trigram substring index plus
-  explicit top-20 caches for one- and two-character nodes. It implements the
-  same normalization, edit variants, cache limits, scores, and result API and
-  is the practical backend for the supplied multi-million-line archive.
+- Scalable backend: two contentless SQLite FTS5 trigram indexes plus compact
+  rank-to-sentence maps and explicit top-20 caches for one- and two-character
+  nodes. The two indexes preserve both required candidate orders without
+  storing the sentence text inside either FTS table. It implements the same
+  normalization, edit variants, cache limits, scores, and result API and is the
+  practical backend for the supplied multi-million-line archive.
 
 The literal structure is available because it directly represents every
 character suffix. The scalable backend is the default because materializing
 every suffix and every node cache for the supplied archive would require far
 more memory than a normal workstation provides.
 
-## Build from the supplied archive
+## Build from the supplied archive folder
 
-No extraction is needed. The default source is `Archive/Archive.zip`:
+No extraction is needed. The default source is the `Archive` directory. Every
+`.txt` file and every ZIP archive in that directory or its subdirectories is
+indexed:
 
 ```powershell
 python build_index.py
 ```
 
-This creates `data/index.pkl`, `data/sentences.pkl`,
-`data/sentences.sqlite3`, and `data/usage_stats.json`.
+This creates `data/index.pkl`, a tiny compatibility manifest at
+`data/sentences.pkl`, the compact `data/sentences.sqlite3`, and
+`data/usage_stats.json`. Sentence text is stored only in SQLite for this
+backend; Trie and Suffix Array builds still serialize their in-memory master
+arrays normally.
 
-Other accepted sources are recursive directories, individual `.txt` files,
-and ZIP archives. Repeat `--source` to combine them:
+### Convert an existing large data directory
+
+Existing SQLite indexes remain loadable without changes. To create a verified,
+compact copy of an old data directory without modifying it:
+
+```powershell
+python optimize_data.py --source data --output data_compact
+python web_app.py --data-dir data_compact
+```
+
+The converter preserves popularity, ranking settings, and analytics, checks
+all row counts, and compares representative searches between the old and new
+indexes before publishing the output directory. Once it has been tested, the
+directories can be swapped atomically while the application is stopped.
+
+## Create a small upload ZIP
+
+For source-code review or transfer, the recommended bundle keeps the complete
+source corpus under `Archive` but excludes generated indexes, Git history,
+caches, logs, and rebuild backups:
+
+```powershell
+python package_project.py
+```
+
+The result is `dist/PUG-source.zip`. After extracting it, run
+`python build_index.py` once to regenerate the compact data. This preserves all
+project capabilities while avoiding transfer of reproducible files.
+
+To include an already-built index for immediate use:
+
+```powershell
+python package_project.py --profile ready
+```
+
+Both profiles verify the finished ZIP. Existing output is protected unless
+`--force` is passed explicitly.
+
+Other accepted sources are recursive directories (including their nested TXT
+and ZIP files), individual `.txt` files, and ZIP archives. Repeat `--source` to
+combine them:
 
 ```powershell
 python build_index.py --source corpus1 --source corpus2.zip --data-dir data
@@ -121,17 +169,46 @@ password. It provides:
   search, result IDs and scores, input method, latency, selection, local client
   metadata, error, server lifecycle event, and administrative action;
 - search totals, typed/voice split, no-result rate, unique and top queries,
-  P50/P95/maximum latency, hourly activity, and recent events;
+  minimum/P50/average/P95/P99/maximum latency for both the current server
+  session and all recorded history, hourly activity, and recent events;
+- measured index load time, live process working-set memory, active-index bytes,
+  bytes per sentence, free disk space, and per-category/per-file storage totals;
+- persistent full-build duration, sentence and input throughput, source/output
+  sizes, live rebuild progress, and whether source metadata differs from the
+  active index manifest; and
+- the generated source ZIP size plus clearly labelled upload-time estimates at
+  10, 50, and 100 Mbps (actual network and remote processing time are external);
 - persistent popularity loaded from `usage_stats.json`, including each sentence's
   usage count and `5 * usage_count` ranking bonus, independently of analytics logs;
 - paginated access to every Master Array record;
 - complete JSON and CSV analytics exports;
 - confirmed actions for resetting analytics or popularity data; and
-- a confirmed, background replacement-index build from `Archive/Archive.zip`.
+- a confirmed, background index build from every TXT and ZIP file under the
+  `Archive` directory, followed by automatic live activation.
 
-Replacement builds are created under `rebuilds/` and never overwrite or
-activate the live index automatically. Reset buttons require their displayed
-confirmation phrase exactly to guard against accidental data loss.
+Completed builds replace the live `data` directory automatically without a
+server restart. A source manifest fingerprints every configured TXT/ZIP input;
+clicking rebuild when nothing changed returns immediately without creating a
+duplicate index. Adding or changing a source file never starts a build by
+itself: an administrator must explicitly click the rebuild action and confirm
+it. Any new supported file below `Archive` is discovered recursively on that
+manually requested rebuild. The build streams records through SQLite and
+uses a bounded page cache instead of retaining the corpus in Python memory.
+
+Activation first moves the old index to a rollback directory, loads and checks
+the replacement, and restores the old directory automatically if activation
+fails. After a successful activation the rollback is removed by default so a
+second multi-gigabyte index does not accumulate. Start the website with
+`--backup-retention 1` (or a larger number) to retain complete historical
+indexes deliberately. Use repeated `--source` options to configure Admin input
+locations instead of the default `Archive` directory:
+
+```powershell
+python web_app.py --source Archive --source extra_corpus.zip
+```
+
+Reset and rebuild buttons require their displayed confirmation phrase exactly
+to guard against accidental data loss.
 
 ## Real-time operational logs
 

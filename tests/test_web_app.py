@@ -598,7 +598,8 @@ class WebApplicationTests(unittest.TestCase):
         self.assertEqual(events[0]["event_type"], "admin_action")
         self.assertEqual(events[0]["action"], "reset_analytics")
 
-    def test_admin_rebuild_reports_missing_configured_archive(self) -> None:
+    def test_admin_rebuild_reports_missing_configured_source(self) -> None:
+        self.admin_service.rebuild_manager.source_path = self.root / "missing"
         with self.assertRaises(HTTPError) as context:
             self.post_json(
                 "/api/admin/actions/rebuild-index",

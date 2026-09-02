@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gc
 import logging
 import time
 from pathlib import Path
@@ -11,7 +12,9 @@ from .models import AutoCompleteData, RankingMode, SentenceRecord
 from .logging_config import log_event
 from .normalization import normalize_text
 from .sqlite_index import SQLiteSubstringIndex
-from .storage import SearchIndex, load_index, save_usage_stats
+from .sqlite_store import SQLiteSentenceStore
+from .storage import MasterArray, SearchIndex, load_index, save_usage_stats
+from .trie import CompressedSuffixTrie
 from autocomplete_system.error_cache import ErrorCache
 
 
@@ -24,7 +27,7 @@ class AutocompleteSystem:
     def __init__(
         self,
         index: SearchIndex,
-        master_array: list[SentenceRecord],
+        master_array: MasterArray,
         data_directory: Path | None = None,
         ranking_mode: RankingMode = RankingMode.ASSIGNMENT,
     ) -> None:
@@ -32,11 +35,17 @@ class AutocompleteSystem:
         self.master_array = master_array
         self.data_directory = data_directory
         self.ranking_mode = ranking_mode
-        self._has_usage_counts = any(record.usage_count for record in master_array)
+        self._has_usage_counts = self._master_has_usage_counts()
+        self.index_load_duration_ms: float | None = None
         self.error_cache = ErrorCache()
         self._search_count = 0
         # Call on activation for demonstration
         self._run_error_cache_worker(trigger="activation")
+
+    def _master_has_usage_counts(self) -> bool:
+        if isinstance(self.master_array, SQLiteSentenceStore):
+            return self.master_array.has_usage_counts
+        return any(record.usage_count for record in self.master_array)
 
     def _run_error_cache_worker(self, trigger: str) -> None:
         """Execute an error cache background cycle with operational logging."""
@@ -74,6 +83,9 @@ class AutocompleteSystem:
         )
         index, master_array = load_index(data_directory)
         system = cls(index, master_array, data_directory, ranking_mode)
+        system.index_load_duration_ms = round(
+            (time.perf_counter() - started) * 1000, 3
+        )
         log_event(
             LOGGER,
             "system_load_completed",
@@ -81,7 +93,7 @@ class AutocompleteSystem:
             ranking_mode=ranking_mode.value,
             backend=type(index).__name__,
             sentence_count=len(master_array),
-            duration_ms=round((time.perf_counter() - started) * 1000, 3),
+            duration_ms=system.index_load_duration_ms,
         )
         return system
 
@@ -284,7 +296,11 @@ class AutocompleteSystem:
 
         if sentence_id < 0 or sentence_id >= len(self.master_array):
             raise IndexError(f"Unknown sentence ID: {sentence_id}")
-        self.master_array[sentence_id].usage_count += 1
+        if isinstance(self.master_array, SQLiteSentenceStore):
+            usage_count = self.master_array.increment_usage(sentence_id)
+        else:
+            self.master_array[sentence_id].usage_count += 1
+            usage_count = self.master_array[sentence_id].usage_count
         self._has_usage_counts = True
         record = self.master_array[sentence_id]
         log_event(
@@ -294,14 +310,17 @@ class AutocompleteSystem:
             completed_sentence=record.original_text,
             source_text=record.source_path,
             offset=record.line_number,
-            usage_count=record.usage_count,
+            usage_count=usage_count,
         )
 
     def reset_usage_counts(self) -> None:
         """Reset every popularity counter without changing the search index."""
 
-        for record in self.master_array:
-            record.usage_count = 0
+        if isinstance(self.master_array, SQLiteSentenceStore):
+            self.master_array.reset_usage_counts()
+        else:
+            for record in self.master_array:
+                record.usage_count = 0
         self._has_usage_counts = False
         log_event(
             LOGGER,
@@ -321,9 +340,54 @@ class AutocompleteSystem:
             data_directory=str(self.data_directory),
         )
 
+    def unload_index(self) -> None:
+        """Release the current index and its records before an atomic replacement."""
+
+        previous_index = self.index
+        previous_backend = type(previous_index).__name__
+        if isinstance(previous_index, SQLiteSubstringIndex):
+            previous_index.close()
+        if isinstance(self.master_array, SQLiteSentenceStore):
+            self.master_array.close()
+        self.index = CompressedSuffixTrie()
+        self.master_array = []
+        self._has_usage_counts = False
+        self.error_cache = ErrorCache()
+        self._search_count = 0
+        del previous_index
+        gc.collect()
+        log_event(LOGGER, "index_unloaded", backend=previous_backend)
+
+    def reload_index(self, data_directory: Path) -> None:
+        """Replace this live system's index from a serialized data directory."""
+
+        started = time.perf_counter()
+        self.unload_index()
+        index, master_array = load_index(data_directory)
+        self.index = index
+        self.master_array = master_array
+        self.data_directory = Path(data_directory)
+        self._has_usage_counts = self._master_has_usage_counts()
+        self.error_cache = ErrorCache()
+        self._search_count = 0
+        self._run_error_cache_worker(trigger="index_reload")
+        self.index_load_duration_ms = round(
+            (time.perf_counter() - started) * 1000, 3
+        )
+        log_event(
+            LOGGER,
+            "live_index_reloaded",
+            data_directory=str(data_directory),
+            backend=type(index).__name__,
+            sentence_count=len(master_array),
+            duration_ms=self.index_load_duration_ms,
+        )
+
     def close(self) -> None:
         """Release resources held by a disk-backed index."""
 
         if isinstance(self.index, SQLiteSubstringIndex):
             self.index.close()
+        if isinstance(self.master_array, SQLiteSentenceStore):
+            self.master_array.close()
         log_event(LOGGER, "system_closed", backend=type(self.index).__name__)

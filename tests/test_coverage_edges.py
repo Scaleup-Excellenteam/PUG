@@ -65,7 +65,7 @@ class ImportContractTests(unittest.TestCase):
         )
         self.assertEqual(constants.MAX_NODE_CACHE_SIZE, 20)
         self.assertEqual(constants.ALPHA, 5)
-        self.assertEqual(constants.DEFAULT_INPUT_SOURCES, (Path("Archive/Archive.zip"),))
+        self.assertEqual(constants.DEFAULT_INPUT_SOURCES, (Path("Archive"),))
         self.assertEqual(constants.SQLITE_VARIANT_BATCH_SIZE, 100)
 
     def test_log_reader_exercises_component_search_and_limit_filters(self) -> None:
@@ -119,6 +119,10 @@ class IndexConstructionEdgeTests(unittest.TestCase):
             def execute(self, *_args: object) -> FakeConnection:
                 return self
 
+            @staticmethod
+            def fetchone() -> tuple[int]:
+                return (100_000,)
+
             def executescript(self, *_args: object) -> FakeConnection:
                 return self
 
@@ -164,7 +168,7 @@ class IndexConstructionEdgeTests(unittest.TestCase):
                 index, master = build_sqlite_index(source, data_directory, progress)
 
             self.assertEqual(len(master), 100_000)
-            self.assertEqual(connection.executemany_calls, 10)
+            self.assertEqual(connection.executemany_calls, 20)
             self.assertEqual(connection.commit_calls, 11)
             self.assertTrue(connection.closed)
             self.assertFalse(temporary_database.exists())

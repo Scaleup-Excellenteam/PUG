@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .logging_config import log_event
+from .source_manifest import SUPPORTED_SOURCE_SUFFIXES
 
 
 LOGGER = logging.getLogger("autocomplete.sources")
@@ -20,6 +21,18 @@ class SourceLine:
     original_text: str
     source_path: str
     line_number: int
+
+
+def _is_indexable_zip_entry(entry: zipfile.ZipInfo) -> bool:
+    """Return whether an archive entry is a real TXT document, not OS metadata."""
+
+    path = Path(entry.filename)
+    return (
+        not entry.is_dir()
+        and entry.filename.lower().endswith(".txt")
+        and "__MACOSX" not in path.parts
+        and not path.name.startswith("._")
+    )
 
 
 def _iter_decoded_lines(stream: io.TextIOBase, source_path: str) -> Iterator[SourceLine]:
@@ -50,13 +63,13 @@ def _iter_text_file(path: Path, display_path: str) -> Iterator[SourceLine]:
     )
 
 
-def _iter_zip(path: Path) -> Iterator[SourceLine]:
+def _iter_zip(path: Path, source_prefix: str = "") -> Iterator[SourceLine]:
     with zipfile.ZipFile(path) as archive:
         entries = sorted(
             (
                 entry
                 for entry in archive.infolist()
-                if not entry.is_dir() and entry.filename.lower().endswith(".txt")
+                if _is_indexable_zip_entry(entry)
             ),
             key=lambda entry: entry.filename,
         )
@@ -68,24 +81,25 @@ def _iter_zip(path: Path) -> Iterator[SourceLine]:
         )
         for entry in entries:
             count = 0
+            display_path = f"{source_prefix}{entry.filename}"
             log_event(
                 LOGGER,
                 "zip_entry_started",
                 archive_path=str(path),
-                source_path=entry.filename,
+                source_path=display_path,
                 compressed_bytes=entry.compress_size,
                 uncompressed_bytes=entry.file_size,
             )
             with archive.open(entry, "r") as binary_stream:
                 with io.TextIOWrapper(binary_stream, encoding="utf-8") as text_stream:
-                    for source_line in _iter_decoded_lines(text_stream, entry.filename):
+                    for source_line in _iter_decoded_lines(text_stream, display_path):
                         count += 1
                         yield source_line
             log_event(
                 LOGGER,
                 "zip_entry_completed",
                 archive_path=str(path),
-                source_path=entry.filename,
+                source_path=display_path,
                 nonblank_line_count=count,
             )
 
@@ -111,10 +125,14 @@ def iter_source_lines(sources: Sequence[Path]) -> Iterator[SourceLine]:
             files = sorted(
                 path
                 for path in source.rglob("*")
-                if path.is_file() and path.suffix.lower() == ".txt"
+                if path.is_file() and path.suffix.lower() in SUPPORTED_SOURCE_SUFFIXES
             )
             for path in files:
-                yield from _iter_text_file(path, path.relative_to(source).as_posix())
+                relative_path = path.relative_to(source).as_posix()
+                if path.suffix.lower() == ".zip":
+                    yield from _iter_zip(path, f"{relative_path}!/")
+                else:
+                    yield from _iter_text_file(path, relative_path)
         elif source.suffix.lower() == ".txt":
             yield from _iter_text_file(source, source.name)
         elif source.suffix.lower() == ".zip":

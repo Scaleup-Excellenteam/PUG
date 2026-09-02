@@ -550,7 +550,7 @@ def create_request_handler(
             assert admin_service is not None and analytics is not None
             try:
                 rebuild = admin_service.start_rebuild()
-            except (FileNotFoundError, RuntimeError) as error:
+            except (FileNotFoundError, RuntimeError, ValueError) as error:
                 self._send_json(HTTPStatus.CONFLICT, {"error": str(error)})
                 return
             analytics.record(
@@ -566,10 +566,15 @@ def create_request_handler(
                 rebuild=rebuild,
                 **self._request_metadata(),
             )
+            unchanged = rebuild.get("state") == "unchanged"
             self._send_json(
-                HTTPStatus.ACCEPTED,
+                HTTPStatus.OK if unchanged else HTTPStatus.ACCEPTED,
                 {
-                    "message": "A non-destructive replacement-index build was started.",
+                    "message": (
+                        "All configured source files are unchanged; the active index is current."
+                        if unchanged
+                        else "A streaming replacement-index build was started."
+                    ),
                     "rebuild": rebuild,
                 },
             )
@@ -765,8 +770,27 @@ def parse_args() -> argparse.Namespace:
             "the saved Admin preference is used, defaulting to popularity."
         ),
     )
+    parser.add_argument(
+        "--source",
+        action="append",
+        type=Path,
+        dest="sources",
+        help=(
+            "TXT file, ZIP file, or recursively scanned directory used by Admin "
+            "rebuilds. Repeat for multiple sources (default: Archive)."
+        ),
+    )
     parser.add_argument("--host", default=DEFAULT_HOST)
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
+    parser.add_argument(
+        "--backup-retention",
+        type=int,
+        default=0,
+        help=(
+            "Number of previous complete indexes retained after successful Admin "
+            "activation (default: 0 to avoid multi-gigabyte duplicates)."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -775,12 +799,20 @@ def run_server(
     host: str = DEFAULT_HOST,
     port: int = DEFAULT_PORT,
     announce: Callable[[str], None] = print,
+    source_paths: tuple[Path, ...] | None = None,
+    backup_retention: int = 0,
 ) -> None:
     """Serve until Ctrl+C, then save mutable usage data and close cleanly."""
 
     project_directory = Path(__file__).resolve().parent
     analytics = AnalyticsStore(system.data_directory or DEFAULT_DATA_DIRECTORY)
-    admin_service = AdminService(system, analytics, project_directory)
+    admin_service = AdminService(
+        system,
+        analytics,
+        project_directory,
+        source_paths=source_paths,
+        backup_retention=backup_retention,
+    )
     analytics.record(
         "server_start",
         host=host,
@@ -821,7 +853,12 @@ def main() -> None:
         RankingMode.POPULARITY,
     )
     system = AutocompleteSystem.load(args.data_dir, ranking_mode)
-    run_server(system, args.host, args.port)
+    server_options: dict[str, Any] = {}
+    if getattr(args, "sources", None):
+        server_options["source_paths"] = tuple(args.sources)
+    if getattr(args, "backup_retention", 0):
+        server_options["backup_retention"] = args.backup_retention
+    run_server(system, args.host, args.port, **server_options)
 
 
 if __name__ == "__main__":

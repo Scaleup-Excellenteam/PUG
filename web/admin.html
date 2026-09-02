@@ -57,6 +57,50 @@
         </article>
       </section>
 
+      <section class="metric-grid technical-metrics" aria-label="Technical metrics">
+        <article class="metric-card metric-card--blue">
+          <span>Active index size</span><strong id="metric-index-size">—</strong><small id="metric-bytes-sentence">— per sentence</small>
+        </article>
+        <article class="metric-card metric-card--green">
+          <span>Process memory</span><strong id="metric-memory">—</strong><small>Live server working set</small>
+        </article>
+        <article class="metric-card metric-card--yellow">
+          <span>Index load time</span><strong id="metric-load-time">—</strong><small>Measured on server start/reload</small>
+        </article>
+        <article class="metric-card metric-card--violet">
+          <span>Last full build</span><strong id="metric-build-time">—</strong><small id="metric-build-rate">Recorded after a measured build</small>
+        </article>
+        <article class="metric-card metric-card--cyan">
+          <span>Source data</span><strong id="metric-source-size">—</strong><small id="metric-source-state">Compared with active index manifest</small>
+        </article>
+        <article class="metric-card metric-card--red">
+          <span>Upload package</span><strong id="metric-package-size">—</strong><small id="metric-package-time">No package found</small>
+        </article>
+      </section>
+
+      <section class="dashboard-grid technical-grid">
+        <article class="panel">
+          <div class="panel__heading"><div><p class="eyebrow">Latency</p><h2>Search performance</h2></div><span id="latency-samples" class="panel__note">— samples</span></div>
+          <div class="table-scroll"><table><thead><tr><th>Scope</th><th>Minimum</th><th>P50</th><th>Average</th><th>P95</th><th>P99</th><th>Maximum</th><th>Recent 100</th></tr></thead><tbody id="latency-metrics"></tbody></table></div>
+        </article>
+        <article class="panel system-health">
+          <div class="panel__heading"><div><p class="eyebrow">Build</p><h2>Last index build</h2></div></div>
+          <dl id="build-metrics"></dl>
+        </article>
+      </section>
+
+      <section class="dashboard-grid technical-grid">
+        <article class="panel">
+          <div class="panel__heading"><div><p class="eyebrow">Storage</p><h2>Storage by category</h2></div><span id="tracked-storage" class="panel__note">— tracked</span></div>
+          <div class="table-scroll"><table><thead><tr><th>Category</th><th>Files</th><th>Size</th></tr></thead><tbody id="storage-categories"></tbody></table></div>
+        </article>
+        <article class="panel">
+          <div class="panel__heading"><div><p class="eyebrow">Transfer estimate</p><h2>ZIP upload times</h2></div><span class="panel__note">Calculated by connection speed</span></div>
+          <div class="table-scroll"><table><thead><tr><th>Upload speed</th><th>Estimated time</th></tr></thead><tbody id="upload-estimates"></tbody></table></div>
+          <p class="technical-note">Network overhead and the destination service's processing time are not included.</p>
+        </article>
+      </section>
+
       <section class="dashboard-grid">
         <article class="panel panel--wide">
           <div class="panel__heading">
@@ -95,7 +139,7 @@
         </article>
         <article class="panel">
           <div class="panel__heading"><div><p class="eyebrow">Disk</p><h2>Data storage</h2></div></div>
-          <div class="table-scroll"><table><thead><tr><th>File</th><th>Size</th><th>Modified</th></tr></thead><tbody id="storage-files"></tbody></table></div>
+          <div class="table-scroll"><table><thead><tr><th>File</th><th>Category</th><th>Size</th><th>Modified</th></tr></thead><tbody id="storage-files"></tbody></table></div>
         </article>
       </section>
 
@@ -143,8 +187,8 @@
             <div class="button-row"><a class="button button--primary" href="/api/admin/export?format=json">Export JSON</a><a class="button button--quiet" href="/api/admin/export?format=csv">Export CSV</a></div>
           </article>
           <article class="action-card">
-            <span class="action-card__icon action-card__icon--yellow">↻</span><h3>Build replacement index</h3><p>Build from Archive.zip in a separate folder. The active index is never overwritten.</p>
-            <button class="button button--warning admin-action" data-action="rebuild-index" type="button">Start safe rebuild</button>
+            <span class="action-card__icon action-card__icon--yellow">↻</span><h3>Build and activate index</h3><p>Nothing is built when files change. This runs only after an administrator explicitly starts and confirms it, then activates the completed index.</p>
+            <button class="button button--warning admin-action" data-action="rebuild-index" type="button">Build and activate</button>
           </article>
           <article class="action-card action-card--danger">
             <span class="action-card__icon action-card__icon--red">×</span><h3>Reset analytics</h3><p>Erase the complete search and administrative event history.</p>
@@ -161,6 +205,7 @@
           <pre id="rebuild-log" hidden></pre>
         </div>
       </section>
+
     </main>
 
     <dialog id="confirmation-dialog">

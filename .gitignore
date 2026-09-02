@@ -4,3 +4,8 @@ data/
 logs/
 rebuilds/
 Archive/
+dist/
+data_compact/
+data_compact_v*/
+.data_compact.tmp-*/
+.data_compact_v*.tmp-*/

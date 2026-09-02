@@ -8,7 +8,7 @@ import sys
 import threading
 import traceback
 from datetime import datetime, timezone
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from types import TracebackType
@@ -23,6 +23,14 @@ DEFAULT_LOG_DIRECTORY = Path(__file__).resolve().parent.parent / "logs"
 
 _configuration_lock = threading.Lock()
 
+try:
+    _LOG_TIMEZONE = ZoneInfo("Asia/Jerusalem")
+except ZoneInfoNotFoundError:
+    # Windows Python installations may not ship the IANA tz database.  The
+    # local system zone is the dependency-free fallback and still preserves
+    # the operator's wall-clock time.
+    _LOG_TIMEZONE = datetime.now().astimezone().tzinfo or timezone.utc
+
 
 class JsonLineFormatter(logging.Formatter):
     """Serialize one complete LogRecord as one UTF-8 JSON object."""
@@ -30,7 +38,7 @@ class JsonLineFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
         payload: dict[str, Any] = {
             "timestamp": datetime.fromtimestamp(
-                record.created, ZoneInfo("Asia/Jerusalem")
+                record.created, _LOG_TIMEZONE
             ).strftime("%Y/%m/%d, %H:%M"),
             "level": record.levelname,
             "logger": record.name,
