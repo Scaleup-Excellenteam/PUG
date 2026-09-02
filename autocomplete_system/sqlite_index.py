@@ -249,6 +249,8 @@ class SQLiteSubstringIndex:
         query: str,
         ranking_mode: RankingMode,
         allow_popularity_exact_shortcut: bool = False,
+        prioritize_qwerty: bool = False,
+        soften_qwerty_penalty: bool = False,
     ) -> dict[int, int]:
         short_cache = (
             self.short_assignment_cache
@@ -289,7 +291,12 @@ class SQLiteSubstringIndex:
             for character in self.alphabet
             if character == " " or (character.isascii() and character.isalnum())
         )
-        variants = generate_scored_variants(query, edit_alphabet)
+        variants = generate_scored_variants(
+            query, 
+            edit_alphabet,
+            prioritize_qwerty=prioritize_qwerty,
+            soften_qwerty_penalty=soften_qwerty_penalty,
+        )
         variants.pop(query, None)
         variants_by_score: dict[int, list[str]] = defaultdict(list)
         for variant, score in variants.items():

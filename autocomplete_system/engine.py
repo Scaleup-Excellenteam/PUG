@@ -27,11 +27,15 @@ class AutocompleteSystem:
         master_array: list[SentenceRecord],
         data_directory: Path | None = None,
         ranking_mode: RankingMode = RankingMode.ASSIGNMENT,
+        prioritize_qwerty: bool = False,
+        soften_qwerty_penalty: bool = False,
     ) -> None:
         self.index = index
         self.master_array = master_array
         self.data_directory = data_directory
         self.ranking_mode = ranking_mode
+        self.prioritize_qwerty = prioritize_qwerty
+        self.soften_qwerty_penalty = soften_qwerty_penalty
         self._has_usage_counts = any(record.usage_count for record in master_array)
         self.error_cache = ErrorCache()
         self._search_count = 0
@@ -128,11 +132,15 @@ class AutocompleteSystem:
                 allow_popularity_exact_shortcut=(
                     not self._has_usage_counts
                 ),
+                prioritize_qwerty=self.prioritize_qwerty,
+                soften_qwerty_penalty=self.soften_qwerty_penalty,
             )
         else:
             text_scores = self.index.candidate_text_scores(
                 search_query,
                 candidate_cache_mode,
+                prioritize_qwerty=self.prioritize_qwerty,
+                soften_qwerty_penalty=self.soften_qwerty_penalty,
             )
         ranked: list[tuple[int, int]] = []
         for sentence_id, text_score in text_scores.items():

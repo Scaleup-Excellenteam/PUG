@@ -8,6 +8,7 @@ from collections.abc import Callable
 from .constants import MAX_NODE_CACHE_SIZE
 from .models import RankingMode
 from .scoring import indel_penalty, substitution_penalty
+from .qwerty import get_qwerty_neighbors, calculate_qwerty_substitution_penalty
 
 CandidateSortKey = Callable[[int], tuple[object, ...]]
 CACHE_DEPTH_LIMIT = 20
@@ -199,7 +200,12 @@ class CompressedSuffixTrie:
         return results
 
     def candidate_text_scores(
-        self, query: str, ranking_mode: RankingMode
+        self,
+        query: str,
+        ranking_mode: RankingMode,
+        allow_popularity_exact_shortcut: bool = False,
+        prioritize_qwerty: bool = False,
+        soften_qwerty_penalty: bool = False,
     ) -> dict[int, int]:
         """Intersect the Trie with a Levenshtein automaton of budget one."""
 
@@ -259,6 +265,11 @@ class CompressedSuffixTrie:
             position = query_index + 1
             transitions = self._next_characters(node, edge, edge_offset)
 
+            qwerty_neighbors = get_qwerty_neighbors(query_character) if (prioritize_qwerty or soften_qwerty_penalty) else set()
+            if prioritize_qwerty:
+                # Sort so QWERTY neighbors are last (will be popped first from LIFO stack)
+                transitions.sort(key=lambda t: t[0] in qwerty_neighbors)
+
             for stored_character, next_node, next_edge, next_offset in transitions:
                 if stored_character == query_character:
                     stack.append(
@@ -272,6 +283,11 @@ class CompressedSuffixTrie:
                         )
                     )
                 elif not edit_used:
+                    penalty = (
+                        calculate_qwerty_substitution_penalty(position)
+                        if soften_qwerty_penalty and stored_character in qwerty_neighbors
+                        else substitution_penalty(position)
+                    )
                     stack.append(
                         (
                             next_node,
@@ -279,7 +295,7 @@ class CompressedSuffixTrie:
                             next_offset,
                             query_index + 1,
                             True,
-                            score - substitution_penalty(position),
+                            score - penalty,
                         )
                     )
 
